@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capabilities for the Darling capsule window","local":true,"windows":["main"],"permissions":["core:default","core:event:allow-emit","core:event:allow-listen","core:window:allow-show","core:window:allow-hide","core:window:allow-set-focus"],"platforms":["macOS"]}}
