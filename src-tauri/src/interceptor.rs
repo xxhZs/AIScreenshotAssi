@@ -7,11 +7,15 @@
 #![allow(non_upper_case_globals, non_snake_case, improper_ctypes)]
 
 use std::ffi::c_void;
+use std::ffi::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
+use objc2::MainThreadMarker;
+use objc2_app_kit::NSApplication;
+use objc2_foundation::{NSArray, NSNumber};
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Listener};
 
@@ -118,6 +122,84 @@ extern "C" {
     );
 }
 
+// ── Private Space APIs (best-effort) ─────────────────────────────────────────
+//
+// On macOS 15, AppKit window collection behaviors are sometimes insufficient
+// for reliably showing above *other apps'* fullscreen Spaces. Many launcher
+// tools (Raycast/Alfred) rely on private WindowServer APIs to attach a window
+// to the currently active Space.
+//
+// We don't link against private frameworks; instead we resolve symbols at
+// runtime using `dlsym`. If not available, we fall back to AppKit behaviors.
+
+extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
+
+type CGSConnectionID = u32;
+type CGSSpaceID = u64;
+
+type MainConnectionFn = unsafe extern "C" fn() -> CGSConnectionID;
+type GetActiveSpaceFn = unsafe extern "C" fn(CGSConnectionID) -> CGSSpaceID;
+type AddWindowsToSpacesFn =
+    unsafe extern "C" fn(CGSConnectionID, *const NSArray<NSNumber>, *const NSArray<NSNumber>) -> i32;
+
+unsafe fn load_fn<T>(name: &'static [u8]) -> Option<T> {
+    let ptr = dlsym(RTLD_DEFAULT, name.as_ptr() as *const c_char);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(std::mem::transmute_copy(&ptr))
+    }
+}
+
+fn try_attach_window_to_active_space(ns_win: &objc2_app_kit::NSWindow) -> bool {
+    let main_conn: Option<MainConnectionFn> = unsafe {
+        load_fn(b"SLSMainConnectionID\0").or_else(|| load_fn(b"CGSMainConnectionID\0"))
+    };
+    let get_active_space: Option<GetActiveSpaceFn> = unsafe {
+        load_fn(b"SLSGetActiveSpace\0").or_else(|| load_fn(b"CGSGetActiveSpace\0"))
+    };
+    let add_windows_to_spaces: Option<AddWindowsToSpacesFn> = unsafe {
+        load_fn(b"SLSAddWindowsToSpaces\0").or_else(|| load_fn(b"CGSAddWindowsToSpaces\0"))
+    };
+
+    let (Some(main_conn), Some(get_active_space), Some(add_windows_to_spaces)) =
+        (main_conn, get_active_space, add_windows_to_spaces)
+    else {
+        eprintln!("[interceptor] Space attach: private symbols not available; falling back");
+        return false;
+    };
+
+    let conn = unsafe { main_conn() };
+    let active_space = unsafe { get_active_space(conn) };
+
+    let win_id = ns_win.windowNumber();
+    if win_id <= 0 {
+        return false;
+    }
+
+    let win_num = NSNumber::numberWithInteger(win_id);
+    let space_num = NSNumber::numberWithUnsignedLongLong(active_space);
+
+    let windows: objc2::rc::Retained<NSArray<NSNumber>> = NSArray::arrayWithObject(&*win_num);
+    let spaces: objc2::rc::Retained<NSArray<NSNumber>> = NSArray::arrayWithObject(&*space_num);
+
+    let rc = unsafe {
+        add_windows_to_spaces(
+            conn,
+            (&*windows) as *const NSArray<NSNumber>,
+            (&*spaces) as *const NSArray<NSNumber>,
+        )
+    };
+    if rc != 0 {
+        eprintln!("[interceptor] Space attach: add_windows_to_spaces failed (rc={rc})");
+    }
+    rc == 0
+}
+
 // ── Global state (accessed from the static C callback) ───────────────────────
 
 /// The Tauri AppHandle shared with the static callback.
@@ -136,35 +218,48 @@ extern "C" fn show_on_main(_ctx: *mut c_void) {
 
     if let Some(handle) = APP_HANDLE.get() {
         if let Some(win) = handle.get_webview_window("main") {
+            let ns_ptr = match win.ns_window() {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+
             let ns_win: &NSWindow = unsafe {
-                let ptr: *const NSWindow = win.ns_window().unwrap() as *const NSWindow;
+                let ptr: *const NSWindow = ns_ptr as *const NSWindow;
                 &*ptr
             };
 
-            // 1. Pull the window off screen so macOS "forgets" which space
-            //    it was on.  This is required before MoveToActiveSpace works.
-            ns_win.orderOut(None);
+            // Keep showing even when our app is not active.
+            ns_win.setHidesOnDeactivate(false);
 
-            // 2. MoveToActiveSpace = macOS moves the window to whatever space
-            //    is CURRENTLY active (including a fullscreen space).
-            //    Transient      = the window is an ephemeral overlay, not
-            //                     bound to any fixed space.
-            //    FullScreenAuxiliary = allowed to coexist with a fullscreen
-            //                         window on the same space.
-            //    IgnoresCycle   = skip Cmd+Tab / Mission Control.
-            ns_win.setCollectionBehavior(
-                NSWindowCollectionBehavior::MoveToActiveSpace
-                    | NSWindowCollectionBehavior::Transient
-                    | NSWindowCollectionBehavior::FullScreenAuxiliary
-                    | NSWindowCollectionBehavior::IgnoresCycle,
-            );
+            // Try to explicitly attach to the currently active Space (best for
+            // showing over other apps' fullscreen Spaces on macOS 15).
+            // If that fails, fall back to AppKit behaviors.
+            if !try_attach_window_to_active_space(ns_win) {
+                // Note: `CanJoinAllSpaces` cannot be combined with `MoveToActiveSpace`.
+                ns_win.orderOut(None);
+                ns_win.setCollectionBehavior(
+                    NSWindowCollectionBehavior::MoveToActiveSpace
+                        | NSWindowCollectionBehavior::CanJoinAllApplications
+                        | NSWindowCollectionBehavior::Transient
+                        | NSWindowCollectionBehavior::FullScreenAuxiliary
+                        | NSWindowCollectionBehavior::IgnoresCycle,
+                );
+            }
 
-            // 3. Maximum z-order so we render above the fullscreen app.
+            // Maximum z-order so we render above the fullscreen app.
             ns_win.setLevel(MAX_WINDOW_LEVEL);
 
-            // 4. Show on the now-current space and accept keyboard input.
+            // Show and take focus so the user can type immediately.
+            ns_win.makeKeyAndOrderFront(None);
             ns_win.orderFrontRegardless();
-            ns_win.makeKeyWindow();
+            if let Some(mtm) = MainThreadMarker::new() {
+                let app = NSApplication::sharedApplication(mtm);
+                app.activateIgnoringOtherApps(true);
+            }
+
+            // Tell the frontend to mount the capsule *after* the window is visible/focused,
+            // so the input autofocus is reliable.
+            let _ = handle.emit("show-capsule", ());
         }
     }
 }
@@ -212,10 +307,6 @@ extern "C" fn tap_callback(
                 CFRelease(bs_up);
             }
 
-            if let Some(handle) = APP_HANDLE.get() {
-                // show-capsule → frontend updates React state.
-                let _ = handle.emit("show-capsule", ());
-            }
             // Show the window on main thread (no space switch).
             unsafe {
                 dispatch_async_f(

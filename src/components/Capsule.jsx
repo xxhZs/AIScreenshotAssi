@@ -51,7 +51,7 @@ export default function Capsule({ onDismiss }) {
       The pill itself is centered and ~580 px wide, Spotlight-style.
     */
     <div
-      className="w-full flex justify-center"
+      className="w-screen h-screen flex justify-center"
       onMouseDown={(e) => {
         // Clicking outside the pill dismisses the capsule.
         if (e.target === e.currentTarget) onDismiss();
