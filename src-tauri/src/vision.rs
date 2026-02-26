@@ -149,10 +149,13 @@ fn local_vision_ocr(screenshot_path: &str) -> Result<Option<String>, String> {
 /// This keeps the *main* LLM a black-box text model: the generator only receives a compact
 /// "screen context" summary derived from the image.
 pub async fn extract_screen_context_from_screenshot(
-    screenshot_path: &str,
+    screenshot_paths: &[String],
     ctx: Option<&ContextSnapshot>,
     user_goal: &str,
 ) -> Result<Option<String>, String> {
+    if screenshot_paths.is_empty() {
+        return Ok(None);
+    }
     // Toggle: keep it opt-in because it can be slow + privacy-sensitive.
     // If the flag is unset, auto-enable when the vision model + key are present
     // (helps avoid "configured but not used" confusion).
@@ -169,7 +172,7 @@ pub async fn extract_screen_context_from_screenshot(
 
     let kind = env_opt("DARLING_VISION_KIND").unwrap_or_else(|| "openai_responses".to_string());
     if kind == "local_ocr" {
-        let text = local_vision_ocr(screenshot_path)?;
+        let text = local_vision_ocr(&screenshot_paths[0])?;
         return Ok(text.map(post_filter).filter(|t| !t.is_empty()));
     }
     if kind != "openai_responses" {
@@ -191,10 +194,16 @@ pub async fn extract_screen_context_from_screenshot(
         None => HashMap::new(),
     };
 
-    let bytes = fs::read(screenshot_path)
-        .map_err(|e| format!("[vision] Failed to read screenshot {screenshot_path}: {e}"))?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    let data_url = format!("data:image/png;base64,{b64}");
+    // Limit pages to keep latency/cost bounded.
+    let max_pages = env_opt("DARLING_VISION_MAX_PAGES")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3);
+    let mut data_urls: Vec<String> = Vec::new();
+    for p in screenshot_paths.iter().take(max_pages) {
+        let bytes = fs::read(p).map_err(|e| format!("[vision] Failed to read screenshot {p}: {e}"))?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        data_urls.push(format!("data:image/png;base64,{b64}"));
+    }
 
     let mut hint = String::new();
     if let Some(c) = ctx {
@@ -213,6 +222,8 @@ pub async fn extract_screen_context_from_screenshot(
     let prompt = format!(
         "You are a macOS screen understanding module.\n\
 Your job is to convert a screenshot into a compact 'screen context' that helps another LLM respond.\n\
+\n\
+You may receive multiple screenshots from the same app taken while scrolling; treat them as consecutive parts of the same context.\n\
 \n\
 Output format:\n\
 - Output ONLY plain text.\n\
@@ -236,16 +247,18 @@ Context hints (not from image):\n\
     );
 
     let url = join_url(&base_url, "/responses");
+    let mut content: Vec<serde_json::Value> = Vec::new();
+    content.push(serde_json::json!({ "type": "input_text", "text": prompt }));
+    for u in data_urls {
+        content.push(serde_json::json!({ "type": "input_image", "image_url": u }));
+    }
     let body = serde_json::json!({
-        "model": model,
-        "input": [{
-            "role": "user",
-            "content": [
-                { "type": "input_text", "text": prompt },
-                { "type": "input_image", "image_url": data_url }
-            ]
-        }],
-        "max_output_tokens": 900
+      "model": model,
+      "input": [{
+        "role": "user",
+        "content": content
+      }],
+      "max_output_tokens": 350
     });
 
     let client = reqwest::Client::builder()

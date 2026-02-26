@@ -44,6 +44,9 @@ const KEY_DOWN_MASK: u64 = 1 << kCGEventKeyDown;
 // If this is wrong, the target app will receive a literal "v" instead of Cmd+V.
 const kCGEventFlagMaskCommand: u64 = 0x0010_0000;
 
+// kCGScrollEventUnitPixel
+const kCGScrollEventUnitPixel: u32 = 0;
+
 // ── CGEventTap locations ──────────────────────────────────────────────────────
 /// kCGHIDEventTap — intercepts hardware events before the window server.
 const kCGHIDEventTap: u32 = 0;
@@ -88,6 +91,16 @@ extern "C" {
     /// Sets a Unicode string for a key-down keyboard event.
     fn CGEventKeyboardSetUnicodeString(event: *mut c_void, stringLength: usize, unicodeString: *const u16);
 
+    /// Non-variadic scroll wheel event creator (macOS 10.13+).
+    fn CGEventCreateScrollWheelEvent2(
+        source: *mut c_void,
+        units: u32,
+        wheelCount: u32,
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
+    ) -> *mut c_void;
+
     /// Posts a CGEvent into the specified event tap stream.
     fn CGEventPost(tapLocation: u32, event: *mut c_void);
 }
@@ -112,6 +125,8 @@ extern "C" {
 
     /// Releases a CoreFoundation object.
     fn CFRelease(cf: *mut c_void);
+
+    fn CFRetain(cf: *const c_void) -> *const c_void;
 
     /// The common modes string — use as the mode argument for CFRunLoopAddSource.
     static kCFRunLoopCommonModes: *const c_void;
@@ -146,6 +161,8 @@ extern "C" {
         attribute: *const c_void,
         value: *mut *mut c_void,
     ) -> i32;
+
+    fn AXUIElementPerformAction(element: *mut c_void, action: *const c_void) -> i32;
 }
 
 // ── libdispatch FFI (dispatch to main thread) ────────────────────────────────
@@ -262,10 +279,53 @@ pub struct ContextSnapshot {
     pub window_title: Option<String>,
     pub selected_text: Option<String>,
     pub screenshot_path: Option<String>,
+    #[serde(default)]
+    pub screenshot_paths: Option<Vec<String>>,
     pub ocr_text: Option<String>,
 }
 
 static LAST_CONTEXT_SNAPSHOT: OnceLock<Mutex<Option<ContextSnapshot>>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct AxUiElement(*mut c_void);
+unsafe impl Send for AxUiElement {}
+unsafe impl Sync for AxUiElement {}
+
+static LAST_TARGET_AX_WINDOW: OnceLock<Mutex<Option<AxUiElement>>> = OnceLock::new();
+
+fn store_last_target_ax_window(win: *mut c_void) {
+    if win.is_null() {
+        return;
+    }
+    let store = LAST_TARGET_AX_WINDOW.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = store.lock() {
+        if let Some(old) = guard.take() {
+            unsafe { CFRelease(old.0) };
+        }
+        let retained = unsafe { CFRetain(win as *const c_void) } as *mut c_void;
+        *guard = Some(AxUiElement(retained));
+    }
+}
+
+fn raise_last_target_window() {
+    let store = LAST_TARGET_AX_WINDOW.get_or_init(|| Mutex::new(None));
+    let win = match store.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    let Some(win) = win else { return; };
+
+    let action = std::ffi::CString::new("AXRaise").ok();
+    let Some(action) = action else { return; };
+    let cf_action = unsafe {
+        CFStringCreateWithCString(std::ptr::null(), action.as_ptr(), kCFStringEncodingUTF8)
+    };
+    if cf_action.is_null() {
+        return;
+    }
+    let _ = unsafe { AXUIElementPerformAction(win.0, cf_action) };
+    unsafe { CFRelease(cf_action as *mut c_void) };
+}
 
 pub fn last_context_snapshot() -> Option<ContextSnapshot> {
     let store = LAST_CONTEXT_SNAPSHOT.get_or_init(|| Mutex::new(None));
@@ -389,6 +449,8 @@ fn capture_accessibility_context(snapshot: &mut ContextSnapshot) {
                 snapshot.window_title = cf_type_to_string(title).map(|s| s.trim().to_string());
                 unsafe { CFRelease(title) };
             }
+            // Store the focused window so we can raise it again before injection.
+            store_last_target_ax_window(win);
             unsafe { CFRelease(win) };
         }
         unsafe { CFRelease(app) };
@@ -417,37 +479,106 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
         return;
     }
 
-    let mut path = std::env::temp_dir();
-    path.push(format!("darling_ctx_{}.png", std::process::id()));
-    let Some(p) = path.to_str() else {
-        return;
+    fn parse_u32_env(name: &str, default: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_bool(name: &str) -> bool {
+        matches!(
+            std::env::var(name).unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }
+
+    fn scroll_pixels(delta: i32) {
+        // Post a smooth scroll event to the session stream.
+        unsafe {
+            let ev = CGEventCreateScrollWheelEvent2(
+                std::ptr::null_mut(),
+                kCGScrollEventUnitPixel,
+                1,
+                delta,
+                0,
+                0,
+            );
+            if !ev.is_null() {
+                CGEventPost(kCGSessionEventTap, ev);
+                CFRelease(ev);
+            }
+        }
+    }
+
+    let scroll_capture = env_bool("DARLING_CTX_SCROLL_CAPTURE");
+    let pages = parse_u32_env("DARLING_CTX_SCROLL_PAGES", 2);
+    let pixels = parse_u32_env("DARLING_CTX_SCROLL_PIXELS", 900) as i32;
+
+    let pid = std::process::id();
+    let mut paths: Vec<String> = Vec::new();
+    let mut capture_idx = 0u32;
+
+    let capture_once = |idx: u32| -> Option<String> {
+        let mut pbuf = std::env::temp_dir();
+        pbuf.push(format!("darling_ctx_{}_{}.png", pid, idx));
+        let p = pbuf.to_string_lossy().to_string();
+        let out = Command::new("screencapture")
+            .args(["-x", "-t", "png", &p])
+            .output();
+        match out {
+            Ok(out) if out.status.success() => Some(p),
+            Ok(out) => {
+                if !SCREENSHOT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    if stderr.is_empty() {
+                        eprintln!("[interceptor] Screenshot capture failed (non-zero exit).");
+                    } else {
+                        eprintln!("[interceptor] Screenshot capture failed: {stderr}");
+                    }
+                    eprintln!(
+                        "[interceptor] Tip: enable Screen Recording permission for Darling, or set DARLING_CTX_SCREENSHOT=0."
+                    );
+                }
+                None
+            }
+            Err(e) => {
+                if !SCREENSHOT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!("[interceptor] Screenshot capture spawn failed: {e}");
+                }
+                None
+            }
+        }
     };
 
-    let status = Command::new("screencapture")
-        .args(["-x", "-t", "png", p])
-        .output();
-    match status {
-        Ok(out) if out.status.success() => {
-            snapshot.screenshot_path = Some(p.to_string());
-        }
-        Ok(out) => {
-            if !SCREENSHOT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                if stderr.is_empty() {
-                    eprintln!("[interceptor] Screenshot capture failed (non-zero exit).");
-                } else {
-                    eprintln!("[interceptor] Screenshot capture failed: {stderr}");
-                }
-                eprintln!(
-                    "[interceptor] Tip: enable Screen Recording permission for Darling, or set DARLING_CTX_SCREENSHOT=0."
-                );
+    if let Some(p) = capture_once(capture_idx) {
+        snapshot.screenshot_path = Some(p.clone());
+        paths.push(p);
+        capture_idx += 1;
+    } else {
+        return;
+    }
+
+    if scroll_capture && pages > 0 {
+        for _ in 0..pages {
+            // Scroll down a bit and let the UI settle.
+            scroll_pixels(-pixels);
+            thread::sleep(Duration::from_millis(160));
+            if let Some(p) = capture_once(capture_idx) {
+                paths.push(p);
             }
+            capture_idx += 1;
         }
-        Err(e) => {
-            if !SCREENSHOT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
-                eprintln!("[interceptor] Screenshot capture spawn failed: {e}");
-            }
+
+        // Best-effort restore: scroll back up.
+        for _ in 0..pages {
+            scroll_pixels(pixels);
+            thread::sleep(Duration::from_millis(80));
         }
+    }
+
+    if paths.len() > 1 {
+        snapshot.screenshot_paths = Some(paths);
     }
 }
 
@@ -482,6 +613,7 @@ fn capture_context_snapshot() {
         window_title: None,
         selected_text: None,
         screenshot_path: None,
+        screenshot_paths: None,
         ocr_text: None,
     };
 
@@ -567,6 +699,10 @@ fn activate_last_target_app() {
 
     let target = apps.objectAtIndex(0);
     let _ = target.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+
+    // Try to bring back the exact window that had focus when the capsule was triggered.
+    // This reduces the chance of typing/paste landing in a different window/tab.
+    raise_last_target_window();
 }
 
 extern "C" fn activate_last_target_on_main(_ctx: *mut c_void) {

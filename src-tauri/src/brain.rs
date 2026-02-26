@@ -67,7 +67,7 @@ fn build_system_prompt(
         "You are Darling, a macOS assistant that generates paste-ready text for the user.\n\
 Rules:\n\
 - Output ONLY the text to paste. No explanations, no markdown fences.\n\
-- Use the provided context to infer who/what the user refers to.\n\
+- Use the provided context (especially the screen context) to infer who/what the user refers to and what they are doing.\n\
 - If context is insufficient, ask ONE short clarifying question instead of guessing.\n",
     );
 
@@ -80,7 +80,10 @@ Rules:\n\
     out.push_str("\nTask intent:\n");
     out.push_str(&format!("- intent: {:?}\n", intent));
 
-    out.push_str("\nEnvironment context (best-effort):\n");
+    out.push_str(
+        "\nEnvironment context (best-effort):\n\
+This snapshot was captured when the user triggered the capsule. Treat it as what the user was doing 'right now'.\n",
+    );
     if let Some(c) = ctx {
         if let Some(name) = &c.app_name {
             out.push_str(&format!("- app_name: {name}\n"));
@@ -126,6 +129,14 @@ Rules:\n\
         out.push_str("- (no snapshot captured)\n");
     }
 
+    out.push_str(
+        "\nBehavior:\n\
+- Decide the most likely scenario yourself based on the screen context and the user's instruction.\n\
+- Examples of scenarios: replying in a chat, continuing a document, drafting an email, writing code, fixing an error, filling a form.\n\
+- Match tone/length to the scenario (chat replies are short; documents are coherent and longer; code is precise).\n\
+- If the user's instruction is vague, use the screen context to choose the best next output instead of asking a generic question.\n",
+    );
+
     out
 }
 
@@ -153,8 +164,14 @@ pub async fn run(req: BrainRequest) -> Result<BrainResponse, String> {
         // Screenshot extraction is intentionally a separate model (vision) step,
         // so the main text-generation LLM can remain a black box.
         if c.ocr_text.is_none() {
-            if let Some(path) = c.screenshot_path.clone() {
-                match vision::extract_screen_context_from_screenshot(&path, Some(c), &input).await {
+            let mut paths: Vec<String> = Vec::new();
+            if let Some(more) = c.screenshot_paths.clone() {
+                paths.extend(more);
+            } else if let Some(p) = c.screenshot_path.clone() {
+                paths.push(p);
+            }
+            if !paths.is_empty() {
+                match vision::extract_screen_context_from_screenshot(&paths, Some(c), &input).await {
                     Ok(Some(text)) => c.ocr_text = Some(text),
                     Ok(None) => {}
                     Err(e) => {
