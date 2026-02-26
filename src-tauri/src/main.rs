@@ -5,7 +5,6 @@ mod interceptor;
 mod brain;
 mod llm;
 mod memory_engine;
-mod vision;
 
 fn load_dotenv() {
     // Best-effort: load `.env` so local dev config works without exporting env vars.

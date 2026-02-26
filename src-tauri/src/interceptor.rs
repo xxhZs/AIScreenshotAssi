@@ -143,6 +143,9 @@ extern "C" {
         encoding: u32,
     ) -> bool;
 
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFBooleanGetValue(boolean: *const c_void) -> bool;
+
     fn CFAttributedStringGetTypeID() -> usize;
     fn CFAttributedStringGetString(theString: *const c_void) -> *const c_void;
 
@@ -151,11 +154,16 @@ extern "C" {
         cStr: *const c_char,
         encoding: u32,
     ) -> *const c_void;
+
+    fn CFArrayGetTypeID() -> usize;
+    fn CFArrayGetCount(theArray: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(theArray: *const c_void, idx: isize) -> *const c_void;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXUIElementCreateSystemWide() -> *mut c_void;
+    fn AXUIElementCreateApplication(pid: i32) -> *mut c_void;
     fn AXUIElementCopyAttributeValue(
         element: *mut c_void,
         attribute: *const c_void,
@@ -278,9 +286,22 @@ pub struct ContextSnapshot {
     pub clipboard_text: Option<String>,
     pub window_title: Option<String>,
     pub selected_text: Option<String>,
+    pub focused_role: Option<String>,
+    pub has_text_caret: Option<bool>,
+    pub full_page_text: Option<String>,
+    pub full_page_method: Option<String>,
+    pub full_page_error: Option<String>,
     pub screenshot_path: Option<String>,
     #[serde(default)]
     pub screenshot_paths: Option<Vec<String>>,
+    /// Screenshot capture strategy: `"single"` or `"scroll"` (best-effort).
+    pub screenshot_capture_kind: Option<String>,
+    /// If scroll capture was used: `"up"`, `"down"`, or `"both"`.
+    pub screenshot_scroll_direction: Option<String>,
+    /// If scroll capture was used: number of extra captures attempted.
+    pub screenshot_scroll_pages: Option<u32>,
+    /// If scroll capture was used: scroll delta in pixels between captures (approx).
+    pub screenshot_scroll_pixels: Option<u32>,
     pub ocr_text: Option<String>,
 }
 
@@ -390,6 +411,28 @@ fn cf_type_to_string(cf: *const c_void) -> Option<String> {
     None
 }
 
+fn cf_type_to_bool(cf: *const c_void) -> Option<bool> {
+    if cf.is_null() {
+        return None;
+    }
+    let tid = unsafe { CFGetTypeID(cf) };
+    if tid == unsafe { CFBooleanGetTypeID() } {
+        return Some(unsafe { CFBooleanGetValue(cf) });
+    }
+    None
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn ax_copy_attr(element: *mut c_void, attr: *const c_void) -> Option<*mut c_void> {
     if element.is_null() || attr.is_null() {
         return None;
@@ -424,6 +467,40 @@ fn capture_accessibility_context(snapshot: &mut ContextSnapshot) {
 
     // Selected text / focused value.
     if let Some(focused) = ax_copy_attr_name(sys, "AXFocusedUIElement") {
+        // Role / editable detection (best-effort "caret present" heuristic).
+        let role = ax_copy_attr_name(focused, "AXRole")
+            .and_then(|v| {
+                let s = cf_type_to_string(v).map(|s| s.trim().to_string());
+                unsafe { CFRelease(v) };
+                s
+            });
+        snapshot.focused_role = role.clone();
+
+        let editable = ax_copy_attr_name(focused, "AXEditable")
+            .and_then(|v| {
+                let b = cf_type_to_bool(v);
+                unsafe { CFRelease(v) };
+                b
+            })
+            .unwrap_or(false);
+
+        let has_range_attr = ax_copy_attr_name(focused, "AXSelectedTextRange")
+            .map(|v| {
+                unsafe { CFRelease(v) };
+                true
+            })
+            .unwrap_or(false);
+
+        // Heuristic: "is there a place where typing would land in the frontmost app?"
+        // Some apps don't reliably expose AXEditable/AXSelectedTextRange even when a caret exists,
+        // so we treat common text-entry roles as caret-present on their own.
+        let role_typing_surface = matches!(
+            role.as_deref(),
+            Some("AXTextField") | Some("AXTextArea") | Some("AXSearchField") | Some("AXComboBox")
+        );
+
+        snapshot.has_text_caret = Some(has_range_attr || editable || role_typing_surface);
+
         if let Some(sel) = ax_copy_attr_name(focused, "AXSelectedText") {
             snapshot.selected_text = cf_type_to_string(sel).map(|s| s.trim().to_string());
             unsafe { CFRelease(sel) };
@@ -461,14 +538,339 @@ fn capture_accessibility_context(snapshot: &mut ContextSnapshot) {
     // Truncate to keep prompt bounded.
     if let Some(t) = snapshot.selected_text.as_mut() {
         if t.len() > 6000 {
-            *t = format!("{}…", &t[..6000]);
+            *t = format!("{}…", truncate_utf8(t, 6000));
         }
     }
     if let Some(t) = snapshot.window_title.as_mut() {
         if t.len() > 400 {
-            *t = format!("{}…", &t[..400]);
+            *t = format!("{}…", truncate_utf8(t, 400));
         }
     }
+}
+
+fn try_capture_full_page_text(snapshot: &mut ContextSnapshot) {
+    static FULLPAGE_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
+
+    let Some(bundle_id) = snapshot.bundle_id.as_deref() else {
+        return;
+    };
+
+    // Default behavior: try full-page capture for supported browsers unless explicitly disabled.
+    // This requires Automation permission on first use.
+    let enabled = match std::env::var("DARLING_CTX_FULLPAGE") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => true,
+    };
+    if !enabled {
+        return;
+    }
+
+    fn chromium_script(app_name: &str) -> String {
+        // Most Chromium browsers support AppleScript with the same surface as Chrome:
+        // - front window → active tab
+        // - execute ... javascript
+        format!(
+            r#"
+tell application "{app_name}"
+  if not (exists front window) then return ""
+  if not (exists active tab of front window) then return ""
+  set theURL to URL of active tab of front window
+  set theTitle to title of active tab of front window
+  set theText to execute active tab of front window javascript "(() => {{ try {{ return (document.body && document.body.innerText) ? document.body.innerText : document.documentElement.innerText; }} catch (e) {{ return ''; }} }})()"
+  return theTitle & "\n" & theURL & "\n\n" & theText
+end tell
+"#
+        )
+    }
+
+    // Only implement the "easy wins" that can reliably return full-page text.
+    // Everything else falls back to screenshot/scroll.
+    let script = match bundle_id {
+        "com.apple.Safari" => r#"
+tell application "Safari"
+  if not (exists front document) then return ""
+  set theURL to URL of front document
+  set theTitle to name of front document
+  set theText to do JavaScript "(() => { try { return (document.body && document.body.innerText) ? document.body.innerText : document.documentElement.innerText; } catch (e) { return ''; } })()" in front document
+  return theTitle & "\n" & theURL & "\n\n" & theText
+end tell
+"#,
+        // Chromium-family browsers.
+        "com.google.Chrome" => {
+            let ok = run_fullpage_script(snapshot, &chromium_script("Google Chrome"), "osascript:Google Chrome", &FULLPAGE_ERROR_LOGGED);
+            if !ok {
+                try_capture_full_page_text_via_accessibility(snapshot);
+            }
+            return;
+        }
+        "com.google.Chrome.canary" => {
+            let ok = run_fullpage_script(snapshot, &chromium_script("Google Chrome Canary"), "osascript:Google Chrome Canary", &FULLPAGE_ERROR_LOGGED);
+            if !ok {
+                try_capture_full_page_text_via_accessibility(snapshot);
+            }
+            return;
+        }
+        "com.google.Chrome.beta" => {
+            let ok = run_fullpage_script(snapshot, &chromium_script("Google Chrome Beta"), "osascript:Google Chrome Beta", &FULLPAGE_ERROR_LOGGED);
+            if !ok {
+                try_capture_full_page_text_via_accessibility(snapshot);
+            }
+            return;
+        }
+        "com.google.Chrome.dev" => {
+            let ok = run_fullpage_script(snapshot, &chromium_script("Google Chrome Dev"), "osascript:Google Chrome Dev", &FULLPAGE_ERROR_LOGGED);
+            if !ok {
+                try_capture_full_page_text_via_accessibility(snapshot);
+            }
+            return;
+        }
+        "org.chromium.Chromium" => {
+            let ok = run_fullpage_script(snapshot, &chromium_script("Chromium"), "osascript:Chromium", &FULLPAGE_ERROR_LOGGED);
+            if !ok {
+                try_capture_full_page_text_via_accessibility(snapshot);
+            }
+            return;
+        }
+        "com.microsoft.Edge" => {
+            let ok = run_fullpage_script(snapshot, &chromium_script("Microsoft Edge"), "osascript:Microsoft Edge", &FULLPAGE_ERROR_LOGGED);
+            if !ok {
+                try_capture_full_page_text_via_accessibility(snapshot);
+            }
+            return;
+        }
+        "com.brave.Browser" => {
+            let ok = run_fullpage_script(snapshot, &chromium_script("Brave Browser"), "osascript:Brave Browser", &FULLPAGE_ERROR_LOGGED);
+            if !ok {
+                try_capture_full_page_text_via_accessibility(snapshot);
+            }
+            return;
+        }
+        "company.thebrowser.Browser" => {
+            let ok = run_fullpage_script(snapshot, &chromium_script("Arc"), "osascript:Arc", &FULLPAGE_ERROR_LOGGED);
+            if !ok {
+                try_capture_full_page_text_via_accessibility(snapshot);
+            }
+            return;
+        }
+        "com.vivaldi.Vivaldi" => {
+            let ok = run_fullpage_script(snapshot, &chromium_script("Vivaldi"), "osascript:Vivaldi", &FULLPAGE_ERROR_LOGGED);
+            if !ok {
+                try_capture_full_page_text_via_accessibility(snapshot);
+            }
+            return;
+        }
+        "com.operasoftware.Opera" => {
+            let ok = run_fullpage_script(snapshot, &chromium_script("Opera"), "osascript:Opera", &FULLPAGE_ERROR_LOGGED);
+            if !ok {
+                try_capture_full_page_text_via_accessibility(snapshot);
+            }
+            return;
+        }
+        _ => return,
+    };
+
+    let ok = run_fullpage_script(snapshot, script, "osascript:Safari", &FULLPAGE_ERROR_LOGGED);
+    if !ok {
+        try_capture_full_page_text_via_accessibility(snapshot);
+    }
+}
+
+fn run_fullpage_script_raw(script: &str) -> Result<Option<String>, String> {
+    let out = Command::new("osascript")
+        .args(["-e", script])
+        .output()
+        .map_err(|e| format!("could not run osascript: {e}"))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err("osascript returned non-zero exit".to_string());
+        }
+        return Err(stderr);
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return Ok(None);
+    }
+
+    // Bound size to keep prompts manageable.
+    let text = if text.len() > 16_000 {
+        format!("{}…", truncate_utf8(&text, 16_000))
+    } else {
+        text
+    };
+    Ok(Some(text))
+}
+
+fn run_fullpage_script(
+    snapshot: &mut ContextSnapshot,
+    script: &str,
+    method_label: &str,
+    logged: &AtomicBool,
+) -> bool {
+    snapshot.full_page_method = Some(method_label.to_string());
+    match run_fullpage_script_raw(script) {
+        Ok(Some(text)) => {
+            snapshot.full_page_text = Some(text);
+            snapshot.full_page_error = None;
+            true
+        }
+        Ok(None) => {
+            snapshot.full_page_text = None;
+            snapshot.full_page_error = Some("empty".to_string());
+            false
+        }
+        Err(e) => {
+            snapshot.full_page_text = None;
+            snapshot.full_page_error = Some(e.clone());
+            if !logged.swap(true, Ordering::Relaxed) {
+                eprintln!("[interceptor] Full-page capture failed: {e}");
+                eprintln!(
+                    "[interceptor] Tip: grant Automation permission for Darling to control your browser, or set DARLING_CTX_FULLPAGE=0."
+                );
+            }
+            false
+        }
+    }
+}
+
+fn is_known_browser_bundle_id(bundle_id: &str) -> bool {
+    matches!(
+        bundle_id,
+        "com.apple.Safari"
+            | "com.google.Chrome"
+            | "com.google.Chrome.canary"
+            | "com.google.Chrome.beta"
+            | "com.google.Chrome.dev"
+            | "org.chromium.Chromium"
+            | "com.microsoft.Edge"
+            | "com.brave.Browser"
+            | "company.thebrowser.Browser"
+            | "com.vivaldi.Vivaldi"
+            | "com.operasoftware.Opera"
+    )
+}
+
+fn try_capture_full_page_text_via_accessibility(snapshot: &mut ContextSnapshot) {
+    if snapshot.full_page_text.is_some() {
+        return;
+    }
+    let Some(bundle_id) = snapshot.bundle_id.as_deref() else {
+        return;
+    };
+    if !is_known_browser_bundle_id(bundle_id) {
+        return;
+    }
+    let Some(pid) = snapshot.pid else {
+        return;
+    };
+
+    fn ax_copy_children(element: *mut c_void, attr: &str) -> Vec<*mut c_void> {
+        let Some(arr) = ax_copy_attr_name(element, attr) else {
+            return Vec::new();
+        };
+        let tid = unsafe { CFGetTypeID(arr as *const c_void) };
+        if tid != unsafe { CFArrayGetTypeID() } {
+            unsafe { CFRelease(arr) };
+            return Vec::new();
+        }
+
+        let count = unsafe { CFArrayGetCount(arr as *const c_void) };
+        let mut out: Vec<*mut c_void> = Vec::new();
+        for idx in 0..count {
+            let v = unsafe { CFArrayGetValueAtIndex(arr as *const c_void, idx) } as *mut c_void;
+            if v.is_null() {
+                continue;
+            }
+            let retained = unsafe { CFRetain(v as *const c_void) } as *mut c_void;
+            if !retained.is_null() {
+                out.push(retained);
+            }
+        }
+        unsafe { CFRelease(arr) };
+        out
+    }
+
+    fn ax_role(element: *mut c_void) -> Option<String> {
+        let role = ax_copy_attr_name(element, "AXRole")?;
+        let out = cf_type_to_string(role);
+        unsafe { CFRelease(role) };
+        out
+    }
+
+    fn ax_text_like(element: *mut c_void) -> Option<String> {
+        for attr in ["AXValue", "AXDocument", "AXDescription"] {
+            if let Some(v) = ax_copy_attr_name(element, attr) {
+                let out = cf_type_to_string(v).map(|s| s.trim().to_string());
+                unsafe { CFRelease(v) };
+                if let Some(out) = out {
+                    if !out.is_empty() {
+                        return Some(out);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    let app = unsafe { AXUIElementCreateApplication(pid) };
+    if app.is_null() {
+        return;
+    }
+    let win = ax_copy_attr_name(app, "AXFocusedWindow");
+    unsafe { CFRelease(app) };
+    let Some(win) = win else {
+        return;
+    };
+
+    // BFS for a web/document node. Bound traversal to avoid pathological trees.
+    let mut queue: Vec<*mut c_void> = vec![win];
+    let mut visited = 0usize;
+    let mut best_text: Option<String> = None;
+
+    while let Some(node) = queue.pop() {
+        visited += 1;
+        if visited > 1200 {
+            unsafe { CFRelease(node) };
+            break;
+        }
+
+        if let Some(role) = ax_role(node) {
+            if role == "AXWebArea" || role == "AXDocument" || role == "AXScrollArea" {
+                if let Some(t) = ax_text_like(node) {
+                    if t.len() > best_text.as_ref().map(|s| s.len()).unwrap_or(0) {
+                        best_text = Some(t);
+                    }
+                }
+            }
+        }
+
+        for attr in ["AXChildren", "AXContents"] {
+            let kids = ax_copy_children(node, attr);
+            for k in kids {
+                queue.push(k);
+            }
+        }
+
+        unsafe { CFRelease(node) };
+    }
+
+    let Some(mut text) = best_text else {
+        if snapshot.full_page_error.is_none() {
+            snapshot.full_page_error = Some("accessibility returned empty".to_string());
+        }
+        return;
+    };
+    if text.len() > 16_000 {
+        text = format!("{}…", truncate_utf8(&text, 16_000));
+    }
+    snapshot.full_page_text = Some(text);
+    snapshot.full_page_method = Some("accessibility".to_string());
+    snapshot.full_page_error = None;
 }
 
 fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
@@ -511,9 +913,41 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
         }
     }
 
-    let scroll_capture = env_bool("DARLING_CTX_SCROLL_CAPTURE");
+    let mut scroll_capture = env_bool("DARLING_CTX_SCROLL_CAPTURE");
     let pages = parse_u32_env("DARLING_CTX_SCROLL_PAGES", 2);
     let pixels = parse_u32_env("DARLING_CTX_SCROLL_PIXELS", 900) as i32;
+    let direction = std::env::var("DARLING_CTX_SCROLL_DIRECTION")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            // Reasonable defaults:
+            // - Chat apps (WeChat): usually need history above.
+            // - Others: capture below by default.
+            match snapshot.bundle_id.as_deref() {
+                Some("com.tencent.xinWeChat") => "up".to_string(),
+                _ => "down".to_string(),
+            }
+        });
+
+    // Automatic safety: if the user is actively typing (text caret exists),
+    // scrolling is intrusive and can change caret/selection.
+    // Allow overriding with `DARLING_CTX_SCROLL_CAPTURE_WHILE_TYPING=1`.
+    let allow_while_typing = env_bool("DARLING_CTX_SCROLL_CAPTURE_WHILE_TYPING");
+    if snapshot.has_text_caret.unwrap_or(false) && !allow_while_typing {
+        scroll_capture = false;
+    }
+
+    // Automatic safety: for known browsers we try full-page capture via scripts/AX.
+    // If that fails, scrolling the viewport is disruptive; prefer a single screenshot.
+    // Allow overriding with `DARLING_CTX_SCROLL_CAPTURE_IN_BROWSER=1`.
+    let allow_in_browser = env_bool("DARLING_CTX_SCROLL_CAPTURE_IN_BROWSER");
+    if !allow_in_browser {
+        if let Some(bid) = snapshot.bundle_id.as_deref() {
+            if is_known_browser_bundle_id(bid) {
+                scroll_capture = false;
+            }
+        }
+    }
 
     let pid = std::process::id();
     let mut paths: Vec<String> = Vec::new();
@@ -560,25 +994,50 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
     }
 
     if scroll_capture && pages > 0 {
-        for _ in 0..pages {
-            // Scroll down a bit and let the UI settle.
-            scroll_pixels(-pixels);
-            thread::sleep(Duration::from_millis(160));
-            if let Some(p) = capture_once(capture_idx) {
-                paths.push(p);
+        let want_down = direction == "down" || direction == "both";
+        let want_up = direction == "up" || direction == "both";
+
+        if want_down {
+            for _ in 0..pages {
+                scroll_pixels(-pixels);
+                thread::sleep(Duration::from_millis(160));
+                if let Some(p) = capture_once(capture_idx) {
+                    paths.push(p);
+                }
+                capture_idx += 1;
             }
-            capture_idx += 1;
+            // Restore to original position.
+            for _ in 0..pages {
+                scroll_pixels(pixels);
+                thread::sleep(Duration::from_millis(80));
+            }
         }
 
-        // Best-effort restore: scroll back up.
-        for _ in 0..pages {
-            scroll_pixels(pixels);
-            thread::sleep(Duration::from_millis(80));
+        if want_up {
+            for _ in 0..pages {
+                scroll_pixels(pixels);
+                thread::sleep(Duration::from_millis(160));
+                if let Some(p) = capture_once(capture_idx) {
+                    paths.push(p);
+                }
+                capture_idx += 1;
+            }
+            // Restore to original position.
+            for _ in 0..pages {
+                scroll_pixels(-pixels);
+                thread::sleep(Duration::from_millis(80));
+            }
         }
     }
 
     if paths.len() > 1 {
         snapshot.screenshot_paths = Some(paths);
+        snapshot.screenshot_capture_kind = Some("scroll".to_string());
+        snapshot.screenshot_scroll_direction = Some(direction);
+        snapshot.screenshot_scroll_pages = Some(pages);
+        snapshot.screenshot_scroll_pixels = Some(pixels.unsigned_abs());
+    } else if snapshot.screenshot_path.is_some() {
+        snapshot.screenshot_capture_kind = Some("single".to_string());
     }
 }
 
@@ -612,8 +1071,17 @@ fn capture_context_snapshot() {
         clipboard_text: None,
         window_title: None,
         selected_text: None,
+        focused_role: None,
+        has_text_caret: None,
+        full_page_text: None,
+        full_page_method: None,
+        full_page_error: None,
         screenshot_path: None,
         screenshot_paths: None,
+        screenshot_capture_kind: None,
+        screenshot_scroll_direction: None,
+        screenshot_scroll_pages: None,
+        screenshot_scroll_pixels: None,
         ocr_text: None,
     };
 
@@ -648,7 +1116,7 @@ fn capture_context_snapshot() {
                     // The user can still explicitly ask us to use clipboard content.
                 } else {
                 let truncated = if t.len() > 2000 {
-                    format!("{}…", &t[..2000])
+                    format!("{}…", truncate_utf8(&t, 2000))
                 } else {
                     t
                 };
@@ -659,7 +1127,25 @@ fn capture_context_snapshot() {
     }
 
     capture_accessibility_context(&mut snapshot);
-    capture_screenshot_best_effort(&mut snapshot);
+
+    // If we can capture full-page text (e.g., browser), do it before screenshots.
+    try_capture_full_page_text(&mut snapshot);
+
+    // Automatic strategy:
+    // - If we successfully captured full-page text, skip screenshots by default
+    //   (faster, less intrusive, and avoids sending images to the vision model).
+    // - Allow opting back into screenshots even with full-page text.
+    let force_screenshot = matches!(
+        std::env::var("DARLING_CTX_SCREENSHOT_ALWAYS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    );
+    if snapshot.full_page_text.is_none() || force_screenshot {
+        capture_screenshot_best_effort(&mut snapshot);
+    }
 
     let store = LAST_CONTEXT_SNAPSHOT.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = store.lock() {

@@ -1,9 +1,22 @@
 use crate::llm::{LlmChatRequest, LlmChatResponse, LlmError, LlmProvider, LlmRole};
+use base64::Engine;
+use std::fs;
 
 fn join_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     let path = path.trim_start_matches('/');
     format!("{base}/{path}")
+}
+
+fn guess_mime(path: &str) -> &'static str {
+    let p = path.to_ascii_lowercase();
+    if p.ends_with(".jpg") || p.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if p.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/png"
+    }
 }
 
 pub async fn chat(client: &reqwest::Client, request: LlmChatRequest) -> Result<LlmChatResponse, LlmError> {
@@ -24,18 +37,55 @@ pub async fn chat(client: &reqwest::Client, request: LlmChatRequest) -> Result<L
 
     let url = join_url(&base_url, "/chat/completions");
 
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    for m in request.messages {
+        // Multimodal (best-effort): for user messages with images, send content parts.
+        // Providers that don't support this may error; in that case users should switch to `openai_responses`.
+        if matches!(m.role, LlmRole::User) {
+            if let Some(paths) = m.image_paths {
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                parts.push(serde_json::json!({ "type": "text", "text": m.content }));
+                let total = paths.len();
+                for (i, p) in paths.iter().enumerate() {
+                    if total > 1 {
+                        parts.push(serde_json::json!({
+                            "type": "text",
+                            "text": format!("Screenshot {}/{} (capture order)", i + 1, total)
+                        }));
+                    }
+                    let bytes = fs::read(p).map_err(|e| {
+                        LlmError::Message(format!(
+                            "[llm/openai_compat] Failed to read image {p}: {e}"
+                        ))
+                    })?;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    let mime = guess_mime(p);
+                    parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{mime};base64,{b64}") }
+                    }));
+                }
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": parts
+                }));
+                continue;
+            }
+        }
+
+        messages.push(serde_json::json!({
+            "role": match m.role {
+                LlmRole::System => "system",
+                LlmRole::User => "user",
+                LlmRole::Assistant => "assistant",
+            },
+            "content": m.content,
+        }));
+    }
+
     let mut body = serde_json::json!({
         "model": request.model,
-        "messages": request.messages.into_iter().map(|m| {
-            serde_json::json!({
-                "role": match m.role {
-                    LlmRole::System => "system",
-                    LlmRole::User => "user",
-                    LlmRole::Assistant => "assistant",
-                },
-                "content": m.content,
-            })
-        }).collect::<Vec<_>>(),
+        "messages": messages,
         "stream": false,
     });
 
@@ -82,4 +132,3 @@ pub async fn chat(client: &reqwest::Client, request: LlmChatRequest) -> Result<L
         raw: Some(raw),
     })
 }
-

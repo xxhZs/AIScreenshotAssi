@@ -11,18 +11,18 @@ html,
 body {
   margin: 0;
   padding: 0;
+  width: 100%;
+  height: 100%;
   background: transparent !important;
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 #root {
   background: transparent;
-  width: 100vw;
-  height: 100vh;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding-top: 120px; /* drop the capsule ~1/5 down from top, Spotlight-style */
+  width: 100%;
+  height: 100%;
 }

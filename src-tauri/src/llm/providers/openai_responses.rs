@@ -1,9 +1,22 @@
 use crate::llm::{LlmChatRequest, LlmChatResponse, LlmError, LlmProvider, LlmRole};
+use base64::Engine;
+use std::fs;
 
 fn join_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     let path = path.trim_start_matches('/');
     format!("{base}/{path}")
+}
+
+fn guess_mime(path: &str) -> &'static str {
+    let p = path.to_ascii_lowercase();
+    if p.ends_with(".jpg") || p.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if p.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/png"
+    }
 }
 
 fn extract_output_text(raw: &serde_json::Value) -> Option<String> {
@@ -59,22 +72,44 @@ pub async fn chat(
 
     let url = join_url(&base_url, "/responses");
 
-    let input = request
-        .messages
-        .into_iter()
-        .map(|m| {
-            serde_json::json!({
-                "role": match m.role {
-                    LlmRole::System => "system",
-                    LlmRole::User => "user",
-                    LlmRole::Assistant => "assistant",
-                },
-                "content": [
-                    { "type": "input_text", "text": m.content }
-                ]
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut input: Vec<serde_json::Value> = Vec::new();
+    for m in request.messages {
+        let mut content =
+            vec![serde_json::json!({ "type": "input_text", "text": m.content })];
+        if matches!(m.role, LlmRole::User) {
+            if let Some(paths) = m.image_paths {
+                let total = paths.len();
+                for (i, p) in paths.iter().enumerate() {
+                    if total > 1 {
+                        content.push(serde_json::json!({
+                            "type": "input_text",
+                            "text": format!("Screenshot {}/{} (capture order)", i + 1, total)
+                        }));
+                    }
+                    let bytes = fs::read(p).map_err(|e| {
+                        LlmError::Message(format!(
+                            "[llm/openai_responses] Failed to read image {p}: {e}"
+                        ))
+                    })?;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    let mime = guess_mime(p);
+                    content.push(serde_json::json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{mime};base64,{b64}")
+                    }));
+                }
+            }
+        }
+
+        input.push(serde_json::json!({
+            "role": match m.role {
+                LlmRole::System => "system",
+                LlmRole::User => "user",
+                LlmRole::Assistant => "assistant",
+            },
+            "content": content
+        }));
+    }
 
     let mut body = serde_json::json!({
         "model": request.model,
@@ -107,4 +142,3 @@ pub async fn chat(
         raw: Some(raw),
     })
 }
-

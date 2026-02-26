@@ -16,6 +16,12 @@ pub enum LlmRole {
 pub struct LlmMessage {
     pub role: LlmRole,
     pub content: String,
+    /// Optional image attachments for multimodal providers.
+    ///
+    /// For now these are local filesystem paths (e.g. screenshots captured by Darling).
+    /// Providers that do not support images may ignore or reject them.
+    #[serde(default)]
+    pub image_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +184,7 @@ pub async fn prompt_from_env(prompt: String) -> Result<String, LlmError> {
         messages: vec![LlmMessage {
             role: LlmRole::User,
             content: prompt,
+            image_paths: None,
         }],
         temperature: None,
         top_p: None,

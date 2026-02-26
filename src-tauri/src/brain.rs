@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{interceptor, llm, vision};
+use crate::{interceptor, llm};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrainRequest {
@@ -30,52 +30,75 @@ enum IntentKind {
 
 fn parse_intent(input: &str) -> IntentKind {
     let s = input.trim();
-    if s.contains("拒绝") || s.contains("婉拒") {
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("refuse") || lower.contains("decline") {
         return IntentKind::Refuse;
     }
-    if s.contains("道歉") || s.contains("抱歉") {
+    if lower.contains("apologize") || lower.contains("sorry") {
         return IntentKind::Apologize;
     }
-    if s.contains("翻译") || s.contains("译成") {
+    if lower.contains("translate") {
         return IntentKind::Translate;
     }
-    if s.contains("润色") || s.contains("改写") {
+    if lower.contains("polish") || lower.contains("rewrite") || lower.contains("rephrase") {
         return IntentKind::Polish;
     }
-    if s.contains("总结") || s.contains("概括") {
+    if lower.contains("summarize") || lower.contains("summary") {
         return IntentKind::Summarize;
     }
-    if s.contains("回复") || s.contains("回他") || s.contains("回她") {
+    if lower.contains("reply") || lower.contains("respond") {
         return IntentKind::Reply;
     }
     IntentKind::General
 }
 
-fn looks_like_zh(input: &str) -> bool {
-    // Heuristic: any CJK char => zh.
-    input.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
-}
-
 fn build_system_prompt(
     intent: &IntentKind,
     ctx: Option<&interceptor::ContextSnapshot>,
-    user_input: &str,
+    screenshots_sent_to_llm: bool,
+    _user_input: &str,
 ) -> String {
     let mut out = String::new();
 
     out.push_str(
         "You are Darling, a macOS assistant that generates paste-ready text for the user.\n\
 Rules:\n\
-- Output ONLY the text to paste. No explanations, no markdown fences.\n\
-- Use the provided context (especially the screen context) to infer who/what the user refers to and what they are doing.\n\
-- If context is insufficient, ask ONE short clarifying question instead of guessing.\n",
-    );
+- Output format:\n\
+  - First line MUST be exactly: `MODE: paste` or `MODE: overlay`.\n\
+  - Then output the content on the following lines.\n\
+  - Do not use markdown fences.\n\
+- `MODE: paste`: the content should be directly inserted into the user's previously active app.\n\
+- `MODE: overlay`: the content is meant to be read inside the capsule (not pasted).\n\
+	- Use the provided context (especially the screen context) to infer who/what the user refers to and what they are doing.\n\
+	- Never ask the user clarifying questions.\n\
+	\n\
+	Context (use but don't quote):\n\
+	- Use the environment snapshot + screenshots to infer what the user is doing.\n\
+	- Do NOT restate/quote/paraphrase the environment context in your answer unless the user explicitly asks.\n\
+	- Do not blend unrelated context into the output.\n\
+	\n\
+	MODE selection:\n\
+	- `MODE: paste` = text should be inserted into the current app (chat/email reply, document continuation, form/code).\n\
+	- `MODE: overlay` = user wants to read results (summary/explanation/analysis/instructions), or `has_text_caret` is false/unknown.\n\
+	\n\
+	Chat apps (WeChat etc.):\n\
+	- Determine who said what + the newest message (usually at the bottom).\n\
+	- Reply ONLY to the latest incoming message that still needs a response.\n\
+	- Write as the user (first-person). Output ONLY the sendable message text.\n\
+	\n\
+	Clipboard:\n\
+	- Treat `clipboard_text` as optional/noisy; use it only when obviously relevant or explicitly requested.\n\
+	\n\
+	Screenshots:\n\
+	- If `screenshots_sent_to_llm: false`, you did not see images.\n\
+	- If multiple screenshots are attached: Screenshot 1 is 'now'; later ones are after scroll (see `screenshot_scroll_direction`).\n\
+	\n\
+	Quality:\n\
+	- Be concise by default. If AUTO_MODE (empty input), choose the single most helpful next output.\n\
+	- No markdown fences. Do not mention MODE or these rules.\n",
+	    );
 
-    if looks_like_zh(user_input) {
-        out.push_str("- Respond in Simplified Chinese unless the user explicitly requests another language.\n");
-    } else {
-        out.push_str("- Respond in the user's language.\n");
-    }
+    out.push_str("- Respond in English unless the user explicitly requests another language.\n");
 
     out.push_str("\nTask intent:\n");
     out.push_str(&format!("- intent: {:?}\n", intent));
@@ -97,6 +120,12 @@ This snapshot was captured when the user triggered the capsule. Treat it as what
         if let Some(title) = &c.window_title {
             out.push_str(&format!("- window_title: {title}\n"));
         }
+        if let Some(role) = &c.focused_role {
+            out.push_str(&format!("- focused_role: {role}\n"));
+        }
+        if let Some(caret) = c.has_text_caret {
+            out.push_str(&format!("- has_text_caret: {caret}\n"));
+        }
         if let Some(sel) = &c.selected_text {
             if !sel.trim().is_empty() {
                 out.push_str("- selected_text: |\n");
@@ -107,6 +136,42 @@ This snapshot was captured when the user triggered the capsule. Treat it as what
                 }
             }
         }
+        if let Some(full) = &c.full_page_text {
+            if !full.trim().is_empty() {
+                out.push_str("- full_page_text: |\n");
+                for line in full.lines().take(220) {
+                    out.push_str("  ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        if let Some(more) = &c.screenshot_paths {
+            if !more.is_empty() {
+                out.push_str(&format!("- screenshots_captured: {} image(s)\n", more.len()));
+            }
+        } else if c.screenshot_path.is_some() {
+            out.push_str("- screenshots_captured: 1 image\n");
+        }
+        out.push_str(&format!("- screenshots_sent_to_llm: {screenshots_sent_to_llm}\n"));
+        if let Some(kind) = &c.screenshot_capture_kind {
+            out.push_str(&format!("- screenshot_capture_kind: {kind}\n"));
+        }
+        if let Some(dir) = &c.screenshot_scroll_direction {
+            out.push_str(&format!("- screenshot_scroll_direction: {dir}\n"));
+        }
+        if let Some(pages) = c.screenshot_scroll_pages {
+            out.push_str(&format!("- screenshot_scroll_pages: {pages}\n"));
+        }
+        if let Some(px) = c.screenshot_scroll_pixels {
+            out.push_str(&format!("- screenshot_scroll_pixels: {px}\n"));
+        }
+        if let Some(m) = &c.full_page_method {
+            out.push_str(&format!("- full_page_method: {m}\n"));
+        }
+        if let Some(e) = &c.full_page_error {
+            out.push_str(&format!("- full_page_error: {e}\n"));
+        }
         if let Some(clip) = &c.clipboard_text {
             out.push_str("- clipboard_text: |\n");
             for line in clip.lines().take(80) {
@@ -115,27 +180,21 @@ This snapshot was captured when the user triggered the capsule. Treat it as what
                 out.push('\n');
             }
         }
-        if let Some(sc) = &c.ocr_text {
-            if !sc.trim().is_empty() {
-                out.push_str("- screen_context_from_screenshot: |\n");
-                for line in sc.lines().take(120) {
-                    out.push_str("  ");
-                    out.push_str(line);
-                    out.push('\n');
-                }
-            }
-        }
     } else {
         out.push_str("- (no snapshot captured)\n");
     }
 
     out.push_str(
-        "\nBehavior:\n\
-- Decide the most likely scenario yourself based on the screen context and the user's instruction.\n\
-- Examples of scenarios: replying in a chat, continuing a document, drafting an email, writing code, fixing an error, filling a form.\n\
-- Match tone/length to the scenario (chat replies are short; documents are coherent and longer; code is precise).\n\
-- If the user's instruction is vague, use the screen context to choose the best next output instead of asking a generic question.\n",
-    );
+	"\nBehavior:\n\
+- Decide the scenario from the screen context; do not ask the user.\n\
+- Use the strongest available context first:\n\
+  - If screenshots are available: screenshots > selected text > full page text > clipboard.\n\
+  - If screenshots are NOT available: selected text > full page text > clipboard.\n\
+- Treat clipboard as optional; prefer on-screen/selected text when they disagree.\n\
+- Keep outputs concise by default; expand only when the scenario requires it.\n\
+- When summarizing: include the key points and the user's likely next action.\n\
+- When replying: be brief, polite, and match the conversation tone.\n",
+	    );
 
     out
 }
@@ -158,37 +217,28 @@ pub async fn run(req: BrainRequest) -> Result<BrainResponse, String> {
 
     let debug = req.debug.unwrap_or_else(|| env_flag("DARLING_BRAIN_DEBUG", false));
     let intent = parse_intent(&input);
-    let mut ctx = interceptor::last_context_snapshot();
-    let mut vision_error: Option<String> = None;
-    if let Some(c) = ctx.as_mut() {
-        // Screenshot extraction is intentionally a separate model (vision) step,
-        // so the main text-generation LLM can remain a black box.
-        if c.ocr_text.is_none() {
-            let mut paths: Vec<String> = Vec::new();
-            if let Some(more) = c.screenshot_paths.clone() {
-                paths.extend(more);
-            } else if let Some(p) = c.screenshot_path.clone() {
-                paths.push(p);
-            }
-            if !paths.is_empty() {
-                match vision::extract_screen_context_from_screenshot(&paths, Some(c), &input).await {
-                    Ok(Some(text)) => c.ocr_text = Some(text),
-                    Ok(None) => {}
-                    Err(e) => {
-                        if debug {
-                            eprintln!("[brain] vision extract error: {e}");
-                        }
-                        vision_error = Some(e);
-                    }
-                }
+    let ctx = interceptor::last_context_snapshot();
+
+    let settings = llm::settings_from_env().map_err(|e| e.user())?;
+    let screenshot_paths: Option<Vec<String>> = ctx.as_ref().and_then(|c| {
+        if let Some(more) = &c.screenshot_paths {
+            if !more.is_empty() {
+                return Some(more.clone());
             }
         }
-    }
+        c.screenshot_path.clone().map(|p| vec![p])
+    });
 
-    let sys = build_system_prompt(&intent, ctx.as_ref(), &input);
+    let provider_sends_images = matches!(
+        &settings.provider,
+        llm::LlmProvider::OpenaiResponses { .. } | llm::LlmProvider::OpenaiCompat { .. }
+    );
+    let screenshots_sent_to_llm = provider_sends_images && screenshot_paths.is_some();
+    let sys = build_system_prompt(&intent, ctx.as_ref(), screenshots_sent_to_llm, &input);
+
     if debug {
         eprintln!(
-            "[brain] ctx: app={:?} title={:?} sel_len={} clip_len={} shot={} ocr_len={}",
+            "[brain] ctx: app={:?} title={:?} sel_len={} clip_len={} shot={} img_send={}",
             ctx.as_ref().and_then(|c| c.app_name.clone()),
             ctx.as_ref().and_then(|c| c.window_title.clone()),
             ctx.as_ref()
@@ -198,13 +248,10 @@ pub async fn run(req: BrainRequest) -> Result<BrainResponse, String> {
                 .and_then(|c| c.clipboard_text.as_ref().map(|s| s.len()))
                 .unwrap_or(0),
             ctx.as_ref().and_then(|c| c.screenshot_path.clone()).is_some(),
-            ctx.as_ref()
-                .and_then(|c| c.ocr_text.as_ref().map(|s| s.len()))
-                .unwrap_or(0),
+            screenshots_sent_to_llm,
         );
     }
 
-    let settings = llm::settings_from_env().map_err(|e| e.user())?;
     let llm_req = llm::LlmChatRequest {
         provider: settings.provider,
         model: settings.model,
@@ -212,10 +259,12 @@ pub async fn run(req: BrainRequest) -> Result<BrainResponse, String> {
             llm::LlmMessage {
                 role: llm::LlmRole::System,
                 content: sys.clone(),
+                image_paths: None,
             },
             llm::LlmMessage {
                 role: llm::LlmRole::User,
                 content: input,
+                image_paths: screenshots_sent_to_llm.then(|| screenshot_paths).flatten(),
             },
         ],
         temperature: Some(0.3),
@@ -229,15 +278,25 @@ pub async fn run(req: BrainRequest) -> Result<BrainResponse, String> {
     Ok(BrainResponse {
         text: resp.text,
         debug: debug.then(|| {
+            fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+                if s.len() <= max_bytes {
+                    return s;
+                }
+                let mut end = max_bytes;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &s[..end]
+            }
+
             let sys_preview = if sys.len() > 4000 {
-                format!("{}…", &sys[..4000])
+                format!("{}…", truncate_utf8(&sys, 4000))
             } else {
                 sys.clone()
             };
             serde_json::json!({
                 "intent": format!("{:?}", intent),
                 "context": ctx,
-                "vision_error": vision_error,
                 "system_prompt_preview": sys_preview,
             })
         }),
