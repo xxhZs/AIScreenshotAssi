@@ -12,17 +12,41 @@ import { emit } from "@tauri-apps/api/event";
  *      active application via simulated Cmd+V.
  *   4. Dismiss the capsule.
  */
-export default function Capsule({ onDismiss }) {
+export default function Capsule({ onDismiss, context }) {
   const inputRef = useRef(null);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
+  const [brainDebug, setBrainDebug] = useState(null);
+  const [lastResult, setLastResult] = useState(null);
+  const [lastEngine, setLastEngine] = useState(null);
+  const [lastInvokeError, setLastInvokeError] = useState(null);
 
   // Auto-focus every time the capsule mounts (i.e. every time it becomes visible).
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+  useEffect(() => {
+    if (context) console.log("[Capsule] context snapshot:", context);
+  }, [context]);
+
+  const ctxFlags = (() => {
+    const flags = [];
+    if (context?.selected_text) flags.push("sel");
+    if (context?.clipboard_text) flags.push("clip");
+    if (context?.window_title) flags.push("title");
+    if (context?.screenshot_path) flags.push("shot");
+    return flags;
+  })();
 
   const handleKeyDown = async (e) => {
+    // Cmd+Shift+D toggles a small debug panel showing captured context.
+    if (e.key?.toLowerCase?.() === "d" && e.metaKey && e.shiftKey) {
+      e.preventDefault();
+      setShowDebug((v) => !v);
+      return;
+    }
+
     if (e.key !== "Enter") return;
     if (!query.trim() || loading) return;
 
@@ -30,9 +54,43 @@ export default function Capsule({ onDismiss }) {
     setLoading(true);
 
     try {
-      // Invoke the Rust `query_memory` command with the user's prompt.
-      // Returns the stub string for now; will return real AI output later.
-      const result = await invoke("query_memory", { query: query.trim() });
+      // Prefer the "brain" layer (context + intent + prompt assembly).
+      let result;
+      try {
+        const resp = await invoke("brain_run", {
+          request: { input: query.trim(), debug: showDebug },
+        });
+        setLastEngine("brain_run");
+        setLastInvokeError(null);
+        setBrainDebug(resp?.debug ?? null);
+        if (resp?.debug) console.log("[Capsule] brain debug:", resp.debug);
+        result = resp?.text ?? "";
+        if (!result) throw new Error("brain_run returned empty text");
+      } catch (e) {
+        console.warn("[Capsule] brain_run failed, falling back to llm_prompt/query_memory:", e);
+        setLastEngine("brain_run_failed");
+        setLastInvokeError(String(e?.message ?? e));
+        setBrainDebug(null);
+        try {
+          result = await invoke("llm_prompt", { prompt: query.trim() });
+          setLastEngine("llm_prompt");
+          setLastInvokeError(null);
+        } catch (e2) {
+          console.warn("[Capsule] llm_prompt failed, falling back to query_memory:", e2);
+          setLastEngine("query_memory");
+          setLastInvokeError(String(e2?.message ?? e2));
+          result = await invoke("query_memory", { query: query.trim() });
+        }
+      }
+
+      // Debug mode: keep the capsule open so you can inspect context/debug output.
+      if (showDebug) {
+        setLastResult(result);
+        return;
+      }
+
+      // Hide the capsule first so focus can return to the interrupted app.
+      await onDismiss();
 
       // Hand the result back to Rust so it can paste it into the active app.
       await emit("inject_text", { text: result });
@@ -41,7 +99,6 @@ export default function Capsule({ onDismiss }) {
     } finally {
       setLoading(false);
       setQuery("");
-      onDismiss();
     }
   };
 
@@ -122,7 +179,9 @@ export default function Capsule({ onDismiss }) {
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
           disabled={loading}
-          placeholder="Ask anything…"
+          placeholder={
+            context?.app_name ? `Ask anything… (${context.app_name})` : "Ask anything…"
+          }
           className={[
             "flex-1 bg-transparent outline-none border-none",
             "text-[15px] font-medium tracking-[-0.01em]",
@@ -139,9 +198,36 @@ export default function Capsule({ onDismiss }) {
         {!loading && (
           <span className="text-[11px] text-white/30 shrink-0 select-none">
             ↵ run
+            {context?.app_name ? ` · ${context.app_name}` : ""}
+            {ctxFlags.length ? ` · ${ctxFlags.join("·")}` : ""}
           </span>
         )}
       </div>
+
+      {showDebug && (
+        <pre
+          className={[
+            "mt-3 w-[580px] max-h-[260px] overflow-auto",
+            "rounded-xl border border-white/15",
+            "bg-black/55 backdrop-blur-2xl",
+            "px-4 py-3 text-[11px] leading-relaxed",
+            "text-white/80",
+            "select-text",
+          ].join(" ")}
+        >
+          {JSON.stringify(
+            {
+              show_capsule_context: context ?? null,
+              last_brain_debug: brainDebug ?? null,
+              last_result_preview: lastResult ?? null,
+              last_engine: lastEngine ?? null,
+              last_invoke_error: lastInvokeError ?? null,
+            },
+            null,
+            2
+          )}
+        </pre>
+      )}
     </div>
   );
 }

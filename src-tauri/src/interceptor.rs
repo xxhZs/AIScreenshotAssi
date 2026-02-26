@@ -8,15 +8,20 @@
 
 use std::ffi::c_void;
 use std::ffi::c_char;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
+use std::process::Command;
 
+use objc2::AnyThread;
 use objc2::MainThreadMarker;
-use objc2_app_kit::NSApplication;
+use objc2_app_kit::{NSApplication, NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
 use objc2_foundation::{NSArray, NSNumber};
+use objc2_foundation::NSString;
 use serde::Deserialize;
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Listener};
 
 // ── macOS virtual key codes ───────────────────────────────────────────────────
@@ -35,7 +40,9 @@ const kCGEventKeyDown: u32 = 10;
 const KEY_DOWN_MASK: u64 = 1 << kCGEventKeyDown;
 
 /// kCGEventFlagMaskCommand — held while posting Cmd+V.
-const kCGEventFlagMaskCommand: u64 = 0x0000_0100_0000;
+// Correct value is (1 << 20) = 0x0010_0000.
+// If this is wrong, the target app will receive a literal "v" instead of Cmd+V.
+const kCGEventFlagMaskCommand: u64 = 0x0010_0000;
 
 // ── CGEventTap locations ──────────────────────────────────────────────────────
 /// kCGHIDEventTap — intercepts hardware events before the window server.
@@ -78,6 +85,9 @@ extern "C" {
     /// Overwrites the modifier-flag bits on an event.
     fn CGEventSetFlags(event: *mut c_void, flags: u64);
 
+    /// Sets a Unicode string for a key-down keyboard event.
+    fn CGEventKeyboardSetUnicodeString(event: *mut c_void, stringLength: usize, unicodeString: *const u16);
+
     /// Posts a CGEvent into the specified event tap stream.
     fn CGEventPost(tapLocation: u32, event: *mut c_void);
 }
@@ -105,6 +115,37 @@ extern "C" {
 
     /// The common modes string — use as the mode argument for CFRunLoopAddSource.
     static kCFRunLoopCommonModes: *const c_void;
+
+    fn CFGetTypeID(cf: *const c_void) -> usize;
+
+    fn CFStringGetTypeID() -> usize;
+    fn CFStringGetLength(theString: *const c_void) -> isize;
+    fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+    fn CFStringGetCString(
+        theString: *const c_void,
+        buffer: *mut c_char,
+        bufferSize: isize,
+        encoding: u32,
+    ) -> bool;
+
+    fn CFAttributedStringGetTypeID() -> usize;
+    fn CFAttributedStringGetString(theString: *const c_void) -> *const c_void;
+
+    fn CFStringCreateWithCString(
+        alloc: *const c_void,
+        cStr: *const c_char,
+        encoding: u32,
+    ) -> *const c_void;
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXUIElementCreateSystemWide() -> *mut c_void;
+    fn AXUIElementCopyAttributeValue(
+        element: *mut c_void,
+        attribute: *const c_void,
+        value: *mut *mut c_void,
+    ) -> i32;
 }
 
 // ── libdispatch FFI (dispatch to main thread) ────────────────────────────────
@@ -156,6 +197,8 @@ unsafe fn load_fn<T>(name: &'static [u8]) -> Option<T> {
 }
 
 fn try_attach_window_to_active_space(ns_win: &objc2_app_kit::NSWindow) -> bool {
+    static ATTACH_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
+
     let main_conn: Option<MainConnectionFn> = unsafe {
         load_fn(b"SLSMainConnectionID\0").or_else(|| load_fn(b"CGSMainConnectionID\0"))
     };
@@ -195,7 +238,9 @@ fn try_attach_window_to_active_space(ns_win: &objc2_app_kit::NSWindow) -> bool {
         )
     };
     if rc != 0 {
-        eprintln!("[interceptor] Space attach: add_windows_to_spaces failed (rc={rc})");
+        if !ATTACH_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!("[interceptor] Space attach: add_windows_to_spaces failed (rc={rc}); falling back");
+        }
     }
     rc == 0
 }
@@ -204,6 +249,329 @@ fn try_attach_window_to_active_space(ns_win: &objc2_app_kit::NSWindow) -> bool {
 
 /// The Tauri AppHandle shared with the static callback.
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+
+/// The app that was frontmost when the capsule was triggered (bundle identifier).
+static LAST_TARGET_BUNDLE_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextSnapshot {
+    pub bundle_id: Option<String>,
+    pub app_name: Option<String>,
+    pub pid: Option<i32>,
+    pub clipboard_text: Option<String>,
+    pub window_title: Option<String>,
+    pub selected_text: Option<String>,
+    pub screenshot_path: Option<String>,
+    pub ocr_text: Option<String>,
+}
+
+static LAST_CONTEXT_SNAPSHOT: OnceLock<Mutex<Option<ContextSnapshot>>> = OnceLock::new();
+
+pub fn last_context_snapshot() -> Option<ContextSnapshot> {
+    let store = LAST_CONTEXT_SNAPSHOT.get_or_init(|| Mutex::new(None));
+    match store.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    }
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+const kCFStringEncodingUTF8: u32 = 0x0800_0100;
+
+fn cf_string_to_rust(cf: *const c_void) -> Option<String> {
+    if cf.is_null() {
+        return None;
+    }
+    let len = unsafe { CFStringGetLength(cf) };
+    if len <= 0 {
+        return Some(String::new());
+    }
+    let max = unsafe { CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) };
+    if max <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; (max as usize) + 1];
+    let ok = unsafe {
+        CFStringGetCString(
+            cf,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len() as isize,
+            kCFStringEncodingUTF8,
+        )
+    };
+    if !ok {
+        return None;
+    }
+    let nul = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..nul].to_vec()).ok()
+}
+
+fn cf_type_to_string(cf: *const c_void) -> Option<String> {
+    if cf.is_null() {
+        return None;
+    }
+    let tid = unsafe { CFGetTypeID(cf) };
+    if tid == unsafe { CFStringGetTypeID() } {
+        return cf_string_to_rust(cf);
+    }
+    if tid == unsafe { CFAttributedStringGetTypeID() } {
+        let inner = unsafe { CFAttributedStringGetString(cf) };
+        return cf_string_to_rust(inner);
+    }
+    None
+}
+
+fn ax_copy_attr(element: *mut c_void, attr: *const c_void) -> Option<*mut c_void> {
+    if element.is_null() || attr.is_null() {
+        return None;
+    }
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe { AXUIElementCopyAttributeValue(element, attr, &mut out) };
+    if rc == 0 && !out.is_null() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn ax_copy_attr_name(element: *mut c_void, name: &str) -> Option<*mut c_void> {
+    let cstr = std::ffi::CString::new(name).ok()?;
+    let cf_attr =
+        unsafe { CFStringCreateWithCString(std::ptr::null(), cstr.as_ptr(), kCFStringEncodingUTF8) };
+    if cf_attr.is_null() {
+        return None;
+    }
+    let out = ax_copy_attr(element, cf_attr);
+    unsafe { CFRelease(cf_attr as *mut c_void) };
+    out
+}
+
+fn capture_accessibility_context(snapshot: &mut ContextSnapshot) {
+    // Best-effort: requires Accessibility permission (already needed for CGEventTap).
+    let sys = unsafe { AXUIElementCreateSystemWide() };
+    if sys.is_null() {
+        return;
+    }
+
+    // Selected text / focused value.
+    if let Some(focused) = ax_copy_attr_name(sys, "AXFocusedUIElement") {
+        if let Some(sel) = ax_copy_attr_name(focused, "AXSelectedText") {
+            snapshot.selected_text = cf_type_to_string(sel).map(|s| s.trim().to_string());
+            unsafe { CFRelease(sel) };
+        }
+        if snapshot
+            .selected_text
+            .as_ref()
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+        {
+            if let Some(val) = ax_copy_attr_name(focused, "AXValue") {
+                snapshot.selected_text = cf_type_to_string(val).map(|s| s.trim().to_string());
+                unsafe { CFRelease(val) };
+            }
+        }
+        unsafe { CFRelease(focused) };
+    }
+
+    // Window title.
+    if let Some(app) = ax_copy_attr_name(sys, "AXFocusedApplication") {
+        if let Some(win) = ax_copy_attr_name(app, "AXFocusedWindow") {
+            if let Some(title) = ax_copy_attr_name(win, "AXTitle") {
+                snapshot.window_title = cf_type_to_string(title).map(|s| s.trim().to_string());
+                unsafe { CFRelease(title) };
+            }
+            unsafe { CFRelease(win) };
+        }
+        unsafe { CFRelease(app) };
+    }
+
+    unsafe { CFRelease(sys) };
+
+    // Truncate to keep prompt bounded.
+    if let Some(t) = snapshot.selected_text.as_mut() {
+        if t.len() > 6000 {
+            *t = format!("{}…", &t[..6000]);
+        }
+    }
+    if let Some(t) = snapshot.window_title.as_mut() {
+        if t.len() > 400 {
+            *t = format!("{}…", &t[..400]);
+        }
+    }
+}
+
+fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
+    static SCREENSHOT_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
+
+    // Opt-in: Screen Recording permission may be required.
+    if !env_flag("DARLING_CTX_SCREENSHOT", false) {
+        return;
+    }
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("darling_ctx_{}.png", std::process::id()));
+    let Some(p) = path.to_str() else {
+        return;
+    };
+
+    let status = Command::new("screencapture")
+        .args(["-x", "-t", "png", p])
+        .output();
+    match status {
+        Ok(out) if out.status.success() => {
+            snapshot.screenshot_path = Some(p.to_string());
+        }
+        Ok(out) => {
+            if !SCREENSHOT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if stderr.is_empty() {
+                    eprintln!("[interceptor] Screenshot capture failed (non-zero exit).");
+                } else {
+                    eprintln!("[interceptor] Screenshot capture failed: {stderr}");
+                }
+                eprintln!(
+                    "[interceptor] Tip: enable Screen Recording permission for Darling, or set DARLING_CTX_SCREENSHOT=0."
+                );
+            }
+        }
+        Err(e) => {
+            if !SCREENSHOT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[interceptor] Screenshot capture spawn failed: {e}");
+            }
+        }
+    }
+}
+
+fn capture_frontmost_target_app() {
+    let Some(frontmost) = NSWorkspace::sharedWorkspace().frontmostApplication() else {
+        return;
+    };
+    let Some(bundle_id) = frontmost.bundleIdentifier() else {
+        return;
+    };
+    let bundle_id = bundle_id.to_string();
+
+    // Avoid capturing ourselves; if the capsule was triggered while Darling was
+    // frontmost, we don't need to refocus anything before pasting.
+    if bundle_id == "com.aiagent.mac" {
+        return;
+    }
+
+    let store = LAST_TARGET_BUNDLE_ID.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = store.lock() {
+        *guard = Some(bundle_id);
+    }
+}
+
+fn capture_context_snapshot() {
+    let frontmost = NSWorkspace::sharedWorkspace().frontmostApplication();
+    let mut snapshot = ContextSnapshot {
+        bundle_id: None,
+        app_name: None,
+        pid: None,
+        clipboard_text: None,
+        window_title: None,
+        selected_text: None,
+        screenshot_path: None,
+        ocr_text: None,
+    };
+
+    if let Some(app) = frontmost {
+        if let Some(bundle_id) = app.bundleIdentifier() {
+            let bid = bundle_id.to_string();
+            if bid != "com.aiagent.mac" {
+                snapshot.bundle_id = Some(bid);
+            }
+        }
+        if let Some(name) = app.localizedName() {
+            snapshot.app_name = Some(name.to_string());
+        }
+        snapshot.pid = Some(app.processIdentifier());
+    }
+
+    // Best-effort clipboard snapshot (helps if user copied the relevant message).
+    // Truncate to avoid huge prompts.
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        if let Ok(text) = cb.get_text() {
+            let t = text.trim().to_string();
+            if !t.is_empty() {
+                // Avoid self-referential noise when the user copied our debug panel or logs.
+                // (Common during development: clipboard contains JSON with keys like
+                // `show_capsule_context` / `last_brain_debug`.)
+                let looks_like_our_debug = t.starts_with('{')
+                    && (t.contains("\"show_capsule_context\"")
+                        || t.contains("\"last_brain_debug\"")
+                        || t.contains("\"system_prompt_preview\""));
+                if looks_like_our_debug {
+                    // Skip clipboard entirely to keep prompts clean.
+                    // The user can still explicitly ask us to use clipboard content.
+                } else {
+                let truncated = if t.len() > 2000 {
+                    format!("{}…", &t[..2000])
+                } else {
+                    t
+                };
+                snapshot.clipboard_text = Some(truncated);
+                }
+            }
+        }
+    }
+
+    capture_accessibility_context(&mut snapshot);
+    capture_screenshot_best_effort(&mut snapshot);
+
+    let store = LAST_CONTEXT_SNAPSHOT.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = store.lock() {
+        *guard = Some(snapshot);
+    }
+}
+
+fn activate_last_target_app() {
+    let store = LAST_TARGET_BUNDLE_ID.get_or_init(|| Mutex::new(None));
+    let bundle_id = match store.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    let Some(bundle_id) = bundle_id else {
+        return;
+    };
+
+    let Ok(cstr) = std::ffi::CString::new(bundle_id) else {
+        return;
+    };
+
+    // SAFETY: CString is NUL-terminated; we keep it alive for the duration of the call.
+    let ns_bundle = unsafe {
+        NSString::initWithUTF8String(
+            NSString::alloc(),
+            std::ptr::NonNull::new(cstr.as_ptr() as *mut _).unwrap(),
+        )
+    };
+    let Some(ns_bundle) = ns_bundle else {
+        return;
+    };
+
+    let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(&ns_bundle);
+    if apps.count() == 0 {
+        return;
+    }
+
+    let target = apps.objectAtIndex(0);
+    let _ = target.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+}
+
+extern "C" fn activate_last_target_on_main(_ctx: *mut c_void) {
+    activate_last_target_app();
+}
 
 /// Show the capsule window on the *current* space (including fullscreen)
 /// without switching spaces.  Must run on the main thread.
@@ -218,6 +586,11 @@ extern "C" fn show_on_main(_ctx: *mut c_void) {
 
     if let Some(handle) = APP_HANDLE.get() {
         if let Some(win) = handle.get_webview_window("main") {
+            // Record the app we are interrupting so we can paste back into it later.
+            // Must happen before we activate our own app/window.
+            capture_context_snapshot();
+            capture_frontmost_target_app();
+
             let ns_ptr = match win.ns_window() {
                 Ok(p) => p,
                 Err(_) => return,
@@ -259,7 +632,8 @@ extern "C" fn show_on_main(_ctx: *mut c_void) {
 
             // Tell the frontend to mount the capsule *after* the window is visible/focused,
             // so the input autofocus is reliable.
-            let _ = handle.emit("show-capsule", ());
+            let payload = last_context_snapshot();
+            let _ = handle.emit("show-capsule", payload);
         }
     }
 }
@@ -352,7 +726,7 @@ pub fn start(app: AppHandle) {
     // Frontend emits: await emit('inject_text', { text: 'AI response here' })
     app.listen("inject_text", |event| {
         match serde_json::from_str::<InjectPayload>(event.payload()) {
-            Ok(p) => inject_via_paste(&p.text),
+            Ok(p) => inject_text_to_target(&p.text),
             Err(e) => eprintln!("[interceptor] inject_text bad payload: {e}"),
         }
     });
@@ -406,7 +780,30 @@ pub fn start(app: AppHandle) {
 
 /// Writes `text` to the macOS clipboard, then posts a synthetic Cmd+V into
 /// the session event stream to paste it into whichever app has focus.
-fn inject_via_paste(text: &str) {
+fn inject_text_to_target(text: &str) {
+    let mode = std::env::var("DARLING_INJECT_MODE")
+        .unwrap_or_else(|_| "unicode".to_string())
+        .trim()
+        .to_ascii_lowercase();
+
+    match mode.as_str() {
+        "clipboard" => inject_via_clipboard_paste(text, false),
+        "clipboard_restore" | "clipboard-restore" => inject_via_clipboard_paste(text, true),
+        "unicode" | "type" | "type_unicode" => inject_via_unicode(text),
+        other => {
+            eprintln!("[interceptor] Unknown DARLING_INJECT_MODE={other}; defaulting to unicode");
+            inject_via_unicode(text)
+        }
+    }
+}
+
+fn inject_via_clipboard_paste(text: &str, restore: bool) {
+    let previous = if restore {
+        arboard::Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok())
+    } else {
+        None
+    };
+
     match arboard::Clipboard::new() {
         Ok(mut board) => {
             if let Err(e) = board.set_text(text) {
@@ -424,6 +821,18 @@ fn inject_via_paste(text: &str) {
     // keystroke is received by the target application.
     thread::sleep(Duration::from_millis(60));
 
+    // We brought Darling to the front to let the user type. For paste, we must
+    // re-activate the previously frontmost app (e.g. VSCode fullscreen) so the
+    // Cmd+V goes to the right window.
+    unsafe {
+        dispatch_async_f(
+            std::ptr::addr_of!(_dispatch_main_q),
+            std::ptr::null_mut(),
+            activate_last_target_on_main,
+        );
+    }
+    thread::sleep(Duration::from_millis(90));
+
     unsafe {
         let v_dn = CGEventCreateKeyboardEvent(std::ptr::null_mut(), kVK_ANSI_V, true);
         let v_up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), kVK_ANSI_V, false);
@@ -436,5 +845,55 @@ fn inject_via_paste(text: &str) {
 
         CFRelease(v_dn);
         CFRelease(v_up);
+    }
+
+    if restore {
+        if let Some(prev) = previous {
+            // Let the paste key event land before we restore.
+            thread::sleep(Duration::from_millis(60));
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(prev);
+            }
+        }
+    }
+}
+
+fn inject_via_unicode(text: &str) {
+    // Re-activate the previously frontmost app so the typed text lands in the right place.
+    unsafe {
+        dispatch_async_f(
+            std::ptr::addr_of!(_dispatch_main_q),
+            std::ptr::null_mut(),
+            activate_last_target_on_main,
+        );
+    }
+    thread::sleep(Duration::from_millis(90));
+
+    // Post Unicode text as keyboard events (does not touch the clipboard).
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    if utf16.is_empty() {
+        return;
+    }
+
+    // Chunk to avoid pathological large events.
+    const CHUNK: usize = 6000;
+    let mut i = 0;
+    while i < utf16.len() {
+        let end = (i + CHUNK).min(utf16.len());
+        let chunk = &utf16[i..end];
+
+        unsafe {
+            let ev = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, true);
+            if ev.is_null() {
+                return;
+            }
+            CGEventKeyboardSetUnicodeString(ev, chunk.len(), chunk.as_ptr());
+            CGEventPost(kCGSessionEventTap, ev);
+            CFRelease(ev);
+        }
+
+        i = end;
+        // Tiny delay so targets process long inserts smoothly.
+        thread::sleep(Duration::from_millis(2));
     }
 }
