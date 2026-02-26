@@ -48,9 +48,10 @@ pub async fn chat(client: &reqwest::Client, request: LlmChatRequest) -> Result<L
                 let total = paths.len();
                 for (i, p) in paths.iter().enumerate() {
                     if total > 1 {
+                        let label = if i == 0 { "trigger view" } else { "after scroll" };
                         parts.push(serde_json::json!({
                             "type": "text",
-                            "text": format!("Screenshot {}/{} (capture order)", i + 1, total)
+                            "text": format!("Screenshot {}/{} ({label})", i + 1, total)
                         }));
                     }
                     let bytes = fs::read(p).map_err(|e| {

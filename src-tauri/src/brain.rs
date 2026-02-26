@@ -91,7 +91,7 @@ Rules:\n\
 	\n\
 	Screenshots:\n\
 	- If `screenshots_sent_to_llm: false`, you did not see images.\n\
-	- If multiple screenshots are attached: Screenshot 1 is 'now'; later ones are after scroll (see `screenshot_scroll_direction`).\n\
+	- If multiple screenshots are attached: Screenshot 1 is the current view at trigger time; later ones are after scrolling and may show older (scroll up) or newer (scroll down) content.\n\
 	\n\
 	Quality:\n\
 	- Be concise by default. If AUTO_MODE (empty input), choose the single most helpful next output.\n\
@@ -154,6 +154,14 @@ This snapshot was captured when the user triggered the capsule. Treat it as what
             out.push_str("- screenshots_captured: 1 image\n");
         }
         out.push_str(&format!("- screenshots_sent_to_llm: {screenshots_sent_to_llm}\n"));
+        if let Some(labels) = &c.screenshot_labels {
+            if !labels.is_empty() {
+                out.push_str("- screenshot_sequence_labels:\n");
+                for (i, l) in labels.iter().take(12).enumerate() {
+                    out.push_str(&format!("  - {}: {l}\n", i + 1));
+                }
+            }
+        }
         if let Some(kind) = &c.screenshot_capture_kind {
             out.push_str(&format!("- screenshot_capture_kind: {kind}\n"));
         }
@@ -236,6 +244,42 @@ pub async fn run(req: BrainRequest) -> Result<BrainResponse, String> {
     let screenshots_sent_to_llm = provider_sends_images && screenshot_paths.is_some();
     let sys = build_system_prompt(&intent, ctx.as_ref(), screenshots_sent_to_llm, &input);
 
+    let user_content = if screenshots_sent_to_llm {
+        if let (Some(c), Some(paths)) = (ctx.as_ref(), screenshot_paths.as_ref()) {
+            if paths.len() > 1 {
+                let dir = c
+                    .screenshot_scroll_direction
+                    .as_deref()
+                    .unwrap_or("unknown");
+                let kind = c
+                    .screenshot_capture_kind
+                    .as_deref()
+                    .unwrap_or("unknown");
+                let labels = c
+                    .screenshot_labels
+                    .as_ref()
+                    .map(|ls| {
+                        let mut out = String::new();
+                        for (i, l) in ls.iter().take(12).enumerate() {
+                            out.push_str(&format!("- Screenshot {}: {l}\n", i + 1));
+                        }
+                        out
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "{input}\n\n[Attached screenshots]\n- count: {}\n- sequence: Screenshot 1 is the view at trigger time (current). Later screenshots are captured after scrolling.\n- scroll_direction: {dir}\n- capture_kind: {kind}\n- labels:\n{labels}- IMPORTANT: screenshots may overlap or skip content; do not assume full continuity.\n- IMPORTANT: do not assume higher screenshot index means newer messages.\n",
+                    paths.len(),
+                )
+            } else {
+                input.clone()
+            }
+        } else {
+            input.clone()
+        }
+    } else {
+        input.clone()
+    };
+
     if debug {
         eprintln!(
             "[brain] ctx: app={:?} title={:?} sel_len={} clip_len={} shot={} img_send={}",
@@ -263,7 +307,7 @@ pub async fn run(req: BrainRequest) -> Result<BrainResponse, String> {
             },
             llm::LlmMessage {
                 role: llm::LlmRole::User,
-                content: input,
+                content: user_content,
                 image_paths: screenshots_sent_to_llm.then(|| screenshot_paths).flatten(),
             },
         ],

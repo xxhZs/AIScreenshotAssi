@@ -294,6 +294,10 @@ pub struct ContextSnapshot {
     pub screenshot_path: Option<String>,
     #[serde(default)]
     pub screenshot_paths: Option<Vec<String>>,
+    /// Human-readable labels aligned with `screenshot_paths` (or the single `screenshot_path`).
+    /// Example: ["trigger view", "after scroll up 1/2", "after scroll up 2/2"].
+    #[serde(default)]
+    pub screenshot_labels: Option<Vec<String>>,
     /// Screenshot capture strategy: `"single"` or `"scroll"` (best-effort).
     pub screenshot_capture_kind: Option<String>,
     /// If scroll capture was used: `"up"`, `"down"`, or `"both"`.
@@ -951,6 +955,7 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
 
     let pid = std::process::id();
     let mut paths: Vec<String> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
     let mut capture_idx = 0u32;
 
     let capture_once = |idx: u32| -> Option<String> {
@@ -988,6 +993,7 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
     if let Some(p) = capture_once(capture_idx) {
         snapshot.screenshot_path = Some(p.clone());
         paths.push(p);
+        labels.push("trigger view".to_string());
         capture_idx += 1;
     } else {
         return;
@@ -998,11 +1004,12 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
         let want_up = direction == "up" || direction == "both";
 
         if want_down {
-            for _ in 0..pages {
+            for step in 0..pages {
                 scroll_pixels(-pixels);
                 thread::sleep(Duration::from_millis(160));
                 if let Some(p) = capture_once(capture_idx) {
                     paths.push(p);
+                    labels.push(format!("after scroll down {}/{}", step + 1, pages));
                 }
                 capture_idx += 1;
             }
@@ -1014,11 +1021,12 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
         }
 
         if want_up {
-            for _ in 0..pages {
+            for step in 0..pages {
                 scroll_pixels(pixels);
                 thread::sleep(Duration::from_millis(160));
                 if let Some(p) = capture_once(capture_idx) {
                     paths.push(p);
+                    labels.push(format!("after scroll up {}/{}", step + 1, pages));
                 }
                 capture_idx += 1;
             }
@@ -1036,8 +1044,10 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
         snapshot.screenshot_scroll_direction = Some(direction);
         snapshot.screenshot_scroll_pages = Some(pages);
         snapshot.screenshot_scroll_pixels = Some(pixels.unsigned_abs());
+        snapshot.screenshot_labels = Some(labels);
     } else if snapshot.screenshot_path.is_some() {
         snapshot.screenshot_capture_kind = Some("single".to_string());
+        snapshot.screenshot_labels = Some(labels);
     }
 }
 
@@ -1078,6 +1088,7 @@ fn capture_context_snapshot() {
         full_page_error: None,
         screenshot_path: None,
         screenshot_paths: None,
+        screenshot_labels: None,
         screenshot_capture_kind: None,
         screenshot_scroll_direction: None,
         screenshot_scroll_pages: None,
