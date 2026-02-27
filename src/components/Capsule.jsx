@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, currentMonitor, primaryMonitor } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 
@@ -9,10 +9,8 @@ import { LogicalSize } from "@tauri-apps/api/dpi";
  *
  * Flow:
  *   1. User types a prompt and hits Enter.
- *   2. Invoke Tauri command `query_memory` → get response string from Rust.
- *   3. Emit `inject_text` → Rust writes to clipboard and pastes into the
- *      active application via simulated Cmd+V.
- *   4. Dismiss the capsule.
+ *   2. Invoke Tauri command `brain_run_async` → external runtime returns result.
+ *   3. Show result inside the capsule.
  */
 export default function Capsule({ onDismiss, context }) {
   const inputRef = useRef(null);
@@ -35,6 +33,10 @@ export default function Capsule({ onDismiss, context }) {
   const [lastInvokeError, setLastInvokeError] = useState(null);
   const [overlayOutput, setOverlayOutput] = useState(null);
   const [copied, setCopied] = useState(false);
+  const [currentJobId, setCurrentJobId] = useState(null);
+  const currentJobIdRef = useRef(null);
+  const [toast, setToast] = useState(null);
+  const [lastRunDir, setLastRunDir] = useState(null);
 
   // Auto-focus every time the capsule mounts (i.e. every time it becomes visible).
   useEffect(() => {
@@ -48,6 +50,47 @@ export default function Capsule({ onDismiss, context }) {
     const t = setTimeout(() => setCopied(false), 900);
     return () => clearTimeout(t);
   }, [copied]);
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 1200);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  useEffect(() => {
+    let unlisten = null;
+    listen("job_done", (event) => {
+      const payload = event?.payload;
+      if (!payload) return;
+      if (!currentJobIdRef.current || payload.job_id !== currentJobIdRef.current) {
+        return;
+      }
+
+      setCurrentJobId(null);
+      currentJobIdRef.current = null;
+      if (payload.run_dir) setLastRunDir(payload.run_dir);
+      if (payload.debug) setBrainDebug(payload.debug);
+      if (!payload.ok) {
+        const errMsg = payload.error || "Job failed";
+        setLastInvokeError(errMsg);
+        setOverlayOutput(errMsg);
+        setLoading(false);
+        return;
+      }
+      setToast("任务完成");
+      applyResult(payload.text || "").catch((err) => {
+        console.error("[Capsule] applyResult failed:", err);
+        setOverlayOutput(String(err?.message ?? err));
+        setLoading(false);
+      });
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const panelWidth = "w-full";
 
@@ -179,6 +222,16 @@ export default function Capsule({ onDismiss, context }) {
     return result;
   };
 
+  const startBackgroundRun = async (input) => {
+    const jobId = await invoke("brain_run_async", {
+      request: { input, debug: showDebug },
+    });
+    setCurrentJobId(jobId);
+    currentJobIdRef.current = jobId;
+    setLastEngine("brain_run_async");
+    setLastInvokeError(null);
+  };
+
   const parseMode = (raw) => {
     const s = (raw ?? "").trimStart();
     const lines = s.split("\n");
@@ -191,6 +244,32 @@ export default function Capsule({ onDismiss, context }) {
     }
     // Fallback if provider didn't follow the contract.
     return { mode: "paste", content: s.trim() };
+  };
+
+  const applyResult = async (result) => {
+    const { mode, content } = parseMode(result);
+    const trimmed = (content ?? "").trim();
+    const caretState = context?.has_text_caret;
+
+    if (!trimmed) {
+      setOverlayOutput("(empty response)");
+      setLastResult("");
+      setQuery("");
+      queueMicrotask(() => inputRef.current?.focus());
+      setLoading(false);
+      return;
+    }
+
+    // Always show results in the capsule (no auto-paste).
+    if (true) {
+      setOverlayOutput(trimmed);
+      setLastResult(trimmed);
+      setQuery("");
+      queueMicrotask(() => inputRef.current?.focus());
+      scheduleResizeBurst();
+      setLoading(false);
+      return;
+    }
   };
 
   const ctxFlags = (() => {
@@ -220,7 +299,6 @@ export default function Capsule({ onDismiss, context }) {
     setLoading(true);
 
     try {
-      let result;
       try {
         const current = query.trim();
         const autoSeed =
@@ -228,72 +306,24 @@ export default function Capsule({ onDismiss, context }) {
 
         // Starting a new run clears any previous overlay content.
         if (overlayOutput) setOverlayOutput(null);
-        result = await runBrain(current || autoSeed);
+        await startBackgroundRun(current || autoSeed);
+        return;
       } catch (e) {
-        console.warn("[Capsule] brain_run failed, falling back to llm_prompt/query_memory:", e);
+        console.warn("[Capsule] brain_run_async failed, falling back to brain_run:", e);
         setLastEngine("brain_run_failed");
         setLastInvokeError(String(e?.message ?? e));
         setBrainDebug(null);
-        try {
-          const prompt = query.trim();
-          if (!prompt) throw new Error("Empty prompt (fallback disabled for auto-mode)");
-          result = await invoke("llm_prompt", { prompt });
-          setLastEngine("llm_prompt");
-          setLastInvokeError(null);
-        } catch (e2) {
-          console.warn("[Capsule] llm_prompt failed, falling back to query_memory:", e2);
-          setLastEngine("query_memory");
-          setLastInvokeError(String(e2?.message ?? e2));
-          const q = query.trim();
-          if (!q) throw new Error("Empty query (fallback disabled for auto-mode)");
-          result = await invoke("query_memory", { query: q });
-        }
-      }
-
-      const { mode, content } = parseMode(result);
-      const trimmed = (content ?? "").trim();
-      const caretState = context?.has_text_caret;
-
-      if (!trimmed) {
-        setOverlayOutput("(empty response)");
-        setLastResult("");
-        setQuery("");
-        queueMicrotask(() => inputRef.current?.focus());
+        const current = query.trim();
+        const autoSeed =
+          "AUTO_MODE: The user pressed Enter with empty input. Based on the screen context, generate the single most appropriate next paste-ready output for what they are doing right now.";
+        const result = await runBrain(current || autoSeed);
+        await applyResult(result);
         return;
       }
-
-      // Show inside capsule (overlay) when:
-      // - the model explicitly requests overlay; OR
-      // - the target app is explicitly detected as having no text caret.
-      //
-      // Note: `has_text_caret` can be missing/unknown for some apps even when a caret exists.
-      // We only block paste when it is explicitly `false`.
-      if (mode === "overlay" || caretState === false) {
-        setOverlayOutput(trimmed);
-        setLastResult(trimmed);
-        setQuery("");
-        queueMicrotask(() => inputRef.current?.focus());
-        scheduleResizeBurst();
-        return;
-      }
-
-      // Debug mode: keep the capsule open so you can inspect context/debug output.
-      if (showDebug) {
-        setLastResult(trimmed);
-        scheduleResizeBurst();
-        return;
-      }
-
-      // Hide the capsule first so focus can return to the interrupted app.
-      await onDismiss();
-
-      // Hand the result back to Rust so it can paste it into the active app.
-      await emit("inject_text", { text: trimmed });
     } catch (err) {
-      console.error("[Capsule] query_memory / inject_text error:", err);
+      console.error("[Capsule] runtime error:", err);
     } finally {
-      setLoading(false);
-      setQuery("");
+      // Loading is cleared when the job finishes.
     }
   };
 
@@ -407,6 +437,7 @@ export default function Capsule({ onDismiss, context }) {
           <span className="truncate">
             {context?.app_name ? context.app_name : ""}
             {ctxFlags.length ? ` · ${ctxFlags.join("·")}` : ""}
+            {toast ? ` · ${toast}` : ""}
           </span>
         </div>
       </div>
@@ -523,6 +554,7 @@ export default function Capsule({ onDismiss, context }) {
               last_result_preview: lastResult ?? null,
               last_engine: lastEngine ?? null,
               last_invoke_error: lastInvokeError ?? null,
+              last_run_dir: lastRunDir ?? null,
             },
             null,
             2

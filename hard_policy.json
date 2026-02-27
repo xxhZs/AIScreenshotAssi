@@ -1,0 +1,33 @@
+{
+  "allow_network": true,
+  "allow_exec": true,
+  "allow_fs_read": true,
+  "allow_fs_write": true,
+  "allow_clipboard": true,
+  "allow_screenshot": true,
+  "allowed_roots": [
+    "/Users/xxhx/sing/Darling"
+  ],
+  "blocked_roots": [
+    "/System",
+    "/Library",
+    "/private"
+  ],
+  "allowed_tools": [
+    "read_file",
+    "list_dir",
+    "get_context"
+  ],
+  "max_steps": 8,
+  "max_tokens_per_call": 3000,
+  "allowed_roles": [
+    "generalist",
+    "outliner",
+    "drafter",
+    "polisher",
+    "critic",
+    "reviser",
+    "analyst",
+    "coder"
+  ]
+}

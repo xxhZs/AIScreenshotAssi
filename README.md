@@ -43,10 +43,20 @@ In `.env`, configure at least one text model (the main model):
 - `DARLING_LLM_API_KEY`
 - `DARLING_LLM_BASE_URL` (if you use a proxy / OpenAI-compatible gateway)
 
-3) Start
+3) Start (one-click)
 
 ```bash
-npm run tauri dev
+npm run dev:all
+```
+
+This command starts both:
+- Python runtime (`runtime/app.py`)
+- Tauri dev app
+
+If Python packages are missing, install them first:
+
+```bash
+pip install -r runtime/requirements.txt
 ```
 
 ## Permissions (important)
