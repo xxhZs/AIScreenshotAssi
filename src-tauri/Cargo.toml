@@ -1,8 +1,8 @@
 [package]
-name = "darling"
+name = "aiscreenshotassi"
 version = "0.1.0"
 edition = "2021"
-description = "Darling — global macOS AI assistant"
+description = "AIScreenshotAssi — global macOS AI assistant"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

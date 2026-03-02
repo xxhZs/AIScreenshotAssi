@@ -230,7 +230,7 @@ export default function Capsule({ onDismiss, context }) {
         if (overlayOutput) setOverlayOutput(null);
         result = await runBrain(current || autoSeed);
       } catch (e) {
-        console.warn("[Capsule] brain_run failed, falling back to llm_prompt/query_memory:", e);
+        console.warn("[Capsule] brain_run failed, falling back to llm_prompt:", e);
         setLastEngine("brain_run_failed");
         setLastInvokeError(String(e?.message ?? e));
         setBrainDebug(null);
@@ -241,12 +241,11 @@ export default function Capsule({ onDismiss, context }) {
           setLastEngine("llm_prompt");
           setLastInvokeError(null);
         } catch (e2) {
-          console.warn("[Capsule] llm_prompt failed, falling back to query_memory:", e2);
-          setLastEngine("query_memory");
+          console.error("[Capsule] llm_prompt failed:", e2);
+          setLastEngine("llm_prompt_failed");
           setLastInvokeError(String(e2?.message ?? e2));
-          const q = query.trim();
-          if (!q) throw new Error("Empty query (fallback disabled for auto-mode)");
-          result = await invoke("query_memory", { query: q });
+          const detail = String(e2?.message ?? e2 ?? "unknown error");
+          result = `MODE: overlay\nAI request failed: ${detail}`;
         }
       }
 

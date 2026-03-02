@@ -360,16 +360,6 @@ pub fn last_context_snapshot() -> Option<ContextSnapshot> {
     }
 }
 
-fn env_flag(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(v) => matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => default,
-    }
-}
-
 const kCFStringEncodingUTF8: u32 = 0x0800_0100;
 
 fn cf_string_to_rust(cf: *const c_void) -> Option<String> {
@@ -552,6 +542,29 @@ fn capture_accessibility_context(snapshot: &mut ContextSnapshot) {
     }
 }
 
+fn env_var_compat(new_name: &str, legacy_name: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(new_name) {
+        return Some(v);
+    }
+    std::env::var(legacy_name).ok()
+}
+
+fn env_flag_compat(new_name: &str, legacy_name: &str, default: bool) -> bool {
+    match env_var_compat(new_name, legacy_name) {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => default,
+    }
+}
+
+fn parse_u32_env_compat(new_name: &str, legacy_name: &str, default: u32) -> u32 {
+    env_var_compat(new_name, legacy_name)
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
 fn try_capture_full_page_text(snapshot: &mut ContextSnapshot) {
     static FULLPAGE_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -561,13 +574,7 @@ fn try_capture_full_page_text(snapshot: &mut ContextSnapshot) {
 
     // Default behavior: try full-page capture for supported browsers unless explicitly disabled.
     // This requires Automation permission on first use.
-    let enabled = match std::env::var("DARLING_CTX_FULLPAGE") {
-        Ok(v) => matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => true,
-    };
+    let enabled = env_flag_compat("AISCREENSHOTASSI_CTX_FULLPAGE", "DARLING_CTX_FULLPAGE", true);
     if !enabled {
         return;
     }
@@ -734,7 +741,7 @@ fn run_fullpage_script(
             if !logged.swap(true, Ordering::Relaxed) {
                 eprintln!("[interceptor] Full-page capture failed: {e}");
                 eprintln!(
-                    "[interceptor] Tip: grant Automation permission for Darling to control your browser, or set DARLING_CTX_FULLPAGE=0."
+                    "[interceptor] Tip: grant Automation permission for AIScreenshotAssi to control your browser, or set AISCREENSHOTASSI_CTX_FULLPAGE=0."
                 );
             }
             false
@@ -881,22 +888,8 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
     static SCREENSHOT_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
 
     // Opt-in: Screen Recording permission may be required.
-    if !env_flag("DARLING_CTX_SCREENSHOT", false) {
+    if !env_flag_compat("AISCREENSHOTASSI_CTX_SCREENSHOT", "DARLING_CTX_SCREENSHOT", false) {
         return;
-    }
-
-    fn parse_u32_env(name: &str, default: u32) -> u32 {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(default)
-    }
-
-    fn env_bool(name: &str) -> bool {
-        matches!(
-            std::env::var(name).unwrap_or_default().trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
     }
 
     fn scroll_pixels(delta: i32) {
@@ -917,11 +910,25 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
         }
     }
 
-    let mut scroll_capture = env_bool("DARLING_CTX_SCROLL_CAPTURE");
-    let pages = parse_u32_env("DARLING_CTX_SCROLL_PAGES", 2);
-    let pixels = parse_u32_env("DARLING_CTX_SCROLL_PIXELS", 900) as i32;
-    let direction = std::env::var("DARLING_CTX_SCROLL_DIRECTION")
-        .ok()
+    let mut scroll_capture = env_flag_compat(
+        "AISCREENSHOTASSI_CTX_SCROLL_CAPTURE",
+        "DARLING_CTX_SCROLL_CAPTURE",
+        false,
+    );
+    let pages = parse_u32_env_compat(
+        "AISCREENSHOTASSI_CTX_SCROLL_PAGES",
+        "DARLING_CTX_SCROLL_PAGES",
+        2,
+    );
+    let pixels = parse_u32_env_compat(
+        "AISCREENSHOTASSI_CTX_SCROLL_PIXELS",
+        "DARLING_CTX_SCROLL_PIXELS",
+        900,
+    ) as i32;
+    let direction = env_var_compat(
+        "AISCREENSHOTASSI_CTX_SCROLL_DIRECTION",
+        "DARLING_CTX_SCROLL_DIRECTION",
+    )
         .map(|v| v.trim().to_ascii_lowercase())
         .unwrap_or_else(|| {
             // Reasonable defaults:
@@ -935,16 +942,24 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
 
     // Automatic safety: if the user is actively typing (text caret exists),
     // scrolling is intrusive and can change caret/selection.
-    // Allow overriding with `DARLING_CTX_SCROLL_CAPTURE_WHILE_TYPING=1`.
-    let allow_while_typing = env_bool("DARLING_CTX_SCROLL_CAPTURE_WHILE_TYPING");
+    // Allow overriding with `AISCREENSHOTASSI_CTX_SCROLL_CAPTURE_WHILE_TYPING=1`.
+    let allow_while_typing = env_flag_compat(
+        "AISCREENSHOTASSI_CTX_SCROLL_CAPTURE_WHILE_TYPING",
+        "DARLING_CTX_SCROLL_CAPTURE_WHILE_TYPING",
+        false,
+    );
     if snapshot.has_text_caret.unwrap_or(false) && !allow_while_typing {
         scroll_capture = false;
     }
 
     // Automatic safety: for known browsers we try full-page capture via scripts/AX.
     // If that fails, scrolling the viewport is disruptive; prefer a single screenshot.
-    // Allow overriding with `DARLING_CTX_SCROLL_CAPTURE_IN_BROWSER=1`.
-    let allow_in_browser = env_bool("DARLING_CTX_SCROLL_CAPTURE_IN_BROWSER");
+    // Allow overriding with `AISCREENSHOTASSI_CTX_SCROLL_CAPTURE_IN_BROWSER=1`.
+    let allow_in_browser = env_flag_compat(
+        "AISCREENSHOTASSI_CTX_SCROLL_CAPTURE_IN_BROWSER",
+        "DARLING_CTX_SCROLL_CAPTURE_IN_BROWSER",
+        false,
+    );
     if !allow_in_browser {
         if let Some(bid) = snapshot.bundle_id.as_deref() {
             if is_known_browser_bundle_id(bid) {
@@ -960,7 +975,7 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
 
     let capture_once = |idx: u32| -> Option<String> {
         let mut pbuf = std::env::temp_dir();
-        pbuf.push(format!("darling_ctx_{}_{}.png", pid, idx));
+        pbuf.push(format!("aiscreenshotassi_ctx_{}_{}.png", pid, idx));
         let p = pbuf.to_string_lossy().to_string();
         let out = Command::new("screencapture")
             .args(["-x", "-t", "png", &p])
@@ -976,7 +991,7 @@ fn capture_screenshot_best_effort(snapshot: &mut ContextSnapshot) {
                         eprintln!("[interceptor] Screenshot capture failed: {stderr}");
                     }
                     eprintln!(
-                        "[interceptor] Tip: enable Screen Recording permission for Darling, or set DARLING_CTX_SCREENSHOT=0."
+                        "[interceptor] Tip: enable Screen Recording permission for AIScreenshotAssi, or set AISCREENSHOTASSI_CTX_SCREENSHOT=0."
                     );
                 }
                 None
@@ -1060,7 +1075,7 @@ fn capture_frontmost_target_app() {
     };
     let bundle_id = bundle_id.to_string();
 
-    // Avoid capturing ourselves; if the capsule was triggered while Darling was
+    // Avoid capturing ourselves; if the capsule was triggered while AIScreenshotAssi was
     // frontmost, we don't need to refocus anything before pasting.
     if bundle_id == "com.aiagent.mac" {
         return;
@@ -1147,7 +1162,10 @@ fn capture_context_snapshot() {
     //   (faster, less intrusive, and avoids sending images to the vision model).
     // - Allow opting back into screenshots even with full-page text.
     let force_screenshot = matches!(
-        std::env::var("DARLING_CTX_SCREENSHOT_ALWAYS")
+        env_var_compat(
+            "AISCREENSHOTASSI_CTX_SCREENSHOT_ALWAYS",
+            "DARLING_CTX_SCREENSHOT_ALWAYS",
+        )
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase()
@@ -1237,10 +1255,16 @@ extern "C" fn show_on_main(_ctx: *mut c_void) {
             // Keep showing even when our app is not active.
             ns_win.setHidesOnDeactivate(false);
 
-            // Try to explicitly attach to the currently active Space (best for
-            // showing over other apps' fullscreen Spaces on macOS 15).
-            // If that fails, fall back to AppKit behaviors.
-            if !try_attach_window_to_active_space(ns_win) {
+            // Private Space API is opt-in because it is fragile across macOS versions.
+            // Enable with AISCREENSHOTASSI_SPACE_ATTACH_PRIVATE=1 (or legacy DARLING_*).
+            let use_private_space_attach = env_flag_compat(
+                "AISCREENSHOTASSI_SPACE_ATTACH_PRIVATE",
+                "DARLING_SPACE_ATTACH_PRIVATE",
+                false,
+            );
+
+            // If private attach is disabled or fails, fall back to AppKit behaviors.
+            if !use_private_space_attach || !try_attach_window_to_active_space(ns_win) {
                 // Note: `CanJoinAllSpaces` cannot be combined with `MoveToActiveSpace`.
                 ns_win.orderOut(None);
                 ns_win.setCollectionBehavior(
@@ -1414,8 +1438,8 @@ pub fn start(app: AppHandle) {
 /// Writes `text` to the macOS clipboard, then posts a synthetic Cmd+V into
 /// the session event stream to paste it into whichever app has focus.
 fn inject_text_to_target(text: &str) {
-    let mode = std::env::var("DARLING_INJECT_MODE")
-        .unwrap_or_else(|_| "unicode".to_string())
+    let mode = env_var_compat("AISCREENSHOTASSI_INJECT_MODE", "DARLING_INJECT_MODE")
+        .unwrap_or_else(|| "unicode".to_string())
         .trim()
         .to_ascii_lowercase();
 
@@ -1424,7 +1448,7 @@ fn inject_text_to_target(text: &str) {
         "clipboard_restore" | "clipboard-restore" => inject_via_clipboard_paste(text, true),
         "unicode" | "type" | "type_unicode" => inject_via_unicode(text),
         other => {
-            eprintln!("[interceptor] Unknown DARLING_INJECT_MODE={other}; defaulting to unicode");
+            eprintln!("[interceptor] Unknown AISCREENSHOTASSI_INJECT_MODE={other}; defaulting to unicode");
             inject_via_unicode(text)
         }
     }
@@ -1454,7 +1478,7 @@ fn inject_via_clipboard_paste(text: &str, restore: bool) {
     // keystroke is received by the target application.
     thread::sleep(Duration::from_millis(60));
 
-    // We brought Darling to the front to let the user type. For paste, we must
+    // We brought AIScreenshotAssi to the front to let the user type. For paste, we must
     // re-activate the previously frontmost app (e.g. VSCode fullscreen) so the
     // Cmd+V goes to the right window.
     unsafe {
