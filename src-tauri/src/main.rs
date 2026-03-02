@@ -52,5 +52,5 @@ fn main() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("fatal: Darling failed to start");
+        .expect("fatal: AIScreenshotAssi failed to start");
 }

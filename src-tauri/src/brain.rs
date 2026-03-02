@@ -61,7 +61,7 @@ fn build_system_prompt(
     let mut out = String::new();
 
     out.push_str(
-        "You are Darling, a macOS assistant that generates paste-ready text for the user.\n\
+        "You are AIScreenshotAssi, a macOS assistant that generates paste-ready text for the user.\n\
 Rules:\n\
 - Output format:\n\
   - First line MUST be exactly: `MODE: paste` or `MODE: overlay`.\n\
@@ -217,13 +217,22 @@ fn env_flag(name: &str, default: bool) -> bool {
     }
 }
 
+fn env_flag_compat(new_name: &str, legacy_name: &str, default: bool) -> bool {
+    if std::env::var(new_name).is_ok() {
+        return env_flag(new_name, default);
+    }
+    env_flag(legacy_name, default)
+}
+
 pub async fn run(req: BrainRequest) -> Result<BrainResponse, String> {
     let input = req.input.trim().to_string();
     if input.is_empty() {
         return Err("[brain] empty input".to_string());
     }
 
-    let debug = req.debug.unwrap_or_else(|| env_flag("DARLING_BRAIN_DEBUG", false));
+    let debug = req
+        .debug
+        .unwrap_or_else(|| env_flag_compat("AISCREENSHOTASSI_BRAIN_DEBUG", "DARLING_BRAIN_DEBUG", false));
     let intent = parse_intent(&input);
     let ctx = interceptor::last_context_snapshot();
 

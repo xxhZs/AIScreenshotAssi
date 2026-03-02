@@ -18,7 +18,7 @@ pub struct LlmMessage {
     pub content: String,
     /// Optional image attachments for multimodal providers.
     ///
-    /// For now these are local filesystem paths (e.g. screenshots captured by Darling).
+    /// For now these are local filesystem paths (e.g. screenshots captured by AIScreenshotAssi).
     /// Providers that do not support images may ignore or reject them.
     #[serde(default)]
     pub image_paths: Option<Vec<String>>,
@@ -115,7 +115,7 @@ pub async fn chat(request: LlmChatRequest) -> Result<LlmChatResponse, LlmError> 
     let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(60_000));
     let client = reqwest::Client::builder()
         .timeout(timeout)
-        .user_agent("Darling/0.1.0 (tauri)")
+        .user_agent("AIScreenshotAssi/0.1.0 (tauri)")
         .build()?;
 
     match &request.provider {
@@ -135,18 +135,30 @@ pub struct LlmEnvSettings {
     pub model: String,
 }
 
+fn env_var_compat(suffix: &str) -> Option<String> {
+    let new_name = format!("AISCREENSHOTASSI_{suffix}");
+    if let Ok(v) = std::env::var(&new_name) {
+        return Some(v);
+    }
+    let legacy_name = format!("DARLING_{suffix}");
+    std::env::var(&legacy_name).ok()
+}
+
 /// Convenience for the UI: read a single "active" provider from env vars.
 ///
-/// - `DARLING_LLM_KIND`: `openai_compat` | `anthropic` | `ollama` | `gemini`
-/// - `DARLING_LLM_MODEL`: model name (required)
-/// - `DARLING_LLM_BASE_URL`: optional base URL (provider-specific default)
-/// - `DARLING_LLM_API_KEY`: optional API key (required for most cloud providers)
+/// - `AISCREENSHOTASSI_LLM_KIND`: `openai_compat` | `anthropic` | `ollama` | `gemini`
+/// - `AISCREENSHOTASSI_LLM_MODEL`: model name (required)
+/// - `AISCREENSHOTASSI_LLM_BASE_URL`: optional base URL (provider-specific default)
+/// - `AISCREENSHOTASSI_LLM_API_KEY`: optional API key (required for most cloud providers)
 pub fn settings_from_env() -> Result<LlmEnvSettings, LlmError> {
-    let kind = std::env::var("DARLING_LLM_KIND").unwrap_or_else(|_| "openai_compat".to_string());
-    let model = std::env::var("DARLING_LLM_MODEL")
-        .map_err(|_| LlmError::Message("[llm] Missing env: DARLING_LLM_MODEL".to_string()))?;
-    let base_url = std::env::var("DARLING_LLM_BASE_URL").ok();
-    let api_key = std::env::var("DARLING_LLM_API_KEY").ok();
+    let kind = env_var_compat("LLM_KIND").unwrap_or_else(|| "openai_compat".to_string());
+    let model = env_var_compat("LLM_MODEL").ok_or_else(|| {
+        LlmError::Message(
+            "[llm] Missing env: AISCREENSHOTASSI_LLM_MODEL (or DARLING_LLM_MODEL)".to_string(),
+        )
+    })?;
+    let base_url = env_var_compat("LLM_BASE_URL");
+    let api_key = env_var_compat("LLM_API_KEY");
 
     let provider = match kind.as_str() {
         "openai_compat" | "openai" | "openai-compatible" => LlmProvider::OpenaiCompat {
@@ -168,7 +180,7 @@ pub fn settings_from_env() -> Result<LlmEnvSettings, LlmError> {
         "gemini" => LlmProvider::Gemini { base_url, api_key },
         other => {
             return Err(LlmError::Message(format!(
-                "[llm] Unsupported DARLING_LLM_KIND: {other}"
+                "[llm] Unsupported LLM kind (AISCREENSHOTASSI_LLM_KIND / DARLING_LLM_KIND): {other}"
             )))
         }
     };

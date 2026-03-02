@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Darling",
+  "productName": "AIScreenshotAssi",
   "version": "0.1.0",
   "identifier": "com.aiagent.mac",
   "build": {
@@ -14,7 +14,7 @@
     "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "darling",
+        "title": "AIScreenshotAssi",
         "width": 420,
         "height": 68,
         "transparent": true,
